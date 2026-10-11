@@ -858,6 +858,7 @@ final class APIHandlers: @unchecked Sendable {
         struct ModelEntry: Encodable {
             let id: String
             let engine: String
+            let engine_name: String
             let name: String
             let size_description: String
             let language_count: Int
@@ -876,6 +877,7 @@ final class APIHandlers: @unchecked Sendable {
                 models.append(ModelEntry(
                     id: model.id,
                     engine: engine.providerId,
+                    engine_name: engine.providerDisplayName,
                     name: model.displayName,
                     size_description: model.sizeDescription,
                     language_count: model.languageCount,
