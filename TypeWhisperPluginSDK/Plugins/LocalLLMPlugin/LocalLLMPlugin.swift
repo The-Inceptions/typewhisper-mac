@@ -300,6 +300,11 @@ final class LocalLLMPlugin: NSObject, ObservableObject, LLMProviderPlugin, LLMPr
     private var activeModelLoadTask: (generation: Int, task: Task<ModelContainer, Error>)?
     private var modelLoadTimeoutTask: Task<Void, Never>?
     private var restoreModelTask: Task<Void, Never>?
+    /// MLX creates its Metal device lazily, so clearing the cache can be the
+    /// first MLX call in this process. Set before this plugin first enters MLX
+    /// and never reset: the runtime outlives deactivation.
+    static let runtimeUsage = OSAllocatedUnfairLock(initialState: false)
+    private(set) var runtimeCacheClearTask: Task<Void, Never>?
 
     private func modelsDirectory() -> URL {
         host?.pluginDataDirectory.appendingPathComponent("models")
@@ -367,7 +372,7 @@ final class LocalLLMPlugin: NSObject, ObservableObject, LLMProviderPlugin, LLMPr
         loadedModelId = nil
         downloadProgress = 0
         modelState = .notLoaded
-        Self.scheduleRuntimeCacheClearWhenInferenceIsIdle()
+        scheduleRuntimeCacheClearWhenInferenceIsIdle()
         host = nil
     }
 
@@ -684,10 +689,12 @@ final class LocalLLMPlugin: NSObject, ObservableObject, LLMProviderPlugin, LLMPr
                 )
             }
             let loadTask = Task<ModelContainer, Error> {
-                try await LLMModelFactory.shared.loadContainer(
+                // Download before entering MLX, so a load cancelled or failed
+                // during the download leaves runtime cleanup cold.
+                let resolved = try await MLXLMCommon.resolve(
+                    configuration: configuration,
                     from: downloader,
-                    using: LocalLLMTokenizerLoader(),
-                    configuration: configuration
+                    useLatest: false
                 ) { progress in
                     guard !Task.isCancelled else { return }
                     let rawFraction = progress.fractionCompleted
@@ -705,6 +712,16 @@ final class LocalLLMPlugin: NSObject, ObservableObject, LLMProviderPlugin, LLMPr
                         )
                     }
                 }
+                try Task.checkCancellation()
+                Self.runtimeUsage.withLock { $0 = true }
+                return try await LLMModelFactory.shared.loadContainer(
+                    from: downloader,
+                    using: LocalLLMTokenizerLoader(),
+                    configuration: ModelConfiguration(
+                        directory: resolved.modelDirectory,
+                        extraEOSTokens: modelDef.extraEOSTokens
+                    )
+                )
             }
             activeModelLoadTask = (generation: loadGeneration, task: loadTask)
             defer {
@@ -755,7 +772,7 @@ final class LocalLLMPlugin: NSObject, ObservableObject, LLMProviderPlugin, LLMPr
         loadedModelId = nil
         downloadProgress = 0
         modelState = .notLoaded
-        Self.scheduleRuntimeCacheClearWhenInferenceIsIdle()
+        scheduleRuntimeCacheClearWhenInferenceIsIdle()
         if clearPersistence {
             host?.setUserDefault(nil, forKey: "loadedModel")
         }
@@ -775,25 +792,30 @@ final class LocalLLMPlugin: NSObject, ObservableObject, LLMProviderPlugin, LLMPr
         loadedModelId = nil
         downloadProgress = 0
         modelState = .notLoaded
-        Self.scheduleRuntimeCacheClearWhenInferenceIsIdle()
+        scheduleRuntimeCacheClearWhenInferenceIsIdle()
         host?.setUserDefault(nil, forKey: "loadedModel")
         try? deleteModelFiles(modelDef)
         host?.notifyCapabilitiesChanged()
     }
 
+    private static var hasUsedRuntime: Bool { runtimeUsage.withLock { $0 } }
+
     private static func clearRuntimeCache() {
+        guard hasUsedRuntime else { return }
         Memory.clearCache()
     }
 
     private static func clearRuntimeCacheWhenInferenceIsIdle() async {
+        guard hasUsedRuntime else { return }
         try? await PluginLocalInferenceGate.shared.withLock {
             Memory.clearCache()
         }
     }
 
-    private static func scheduleRuntimeCacheClearWhenInferenceIsIdle() {
-        Task {
-            await clearRuntimeCacheWhenInferenceIsIdle()
+    private func scheduleRuntimeCacheClearWhenInferenceIsIdle() {
+        guard Self.hasUsedRuntime else { return }
+        runtimeCacheClearTask = Task {
+            await Self.clearRuntimeCacheWhenInferenceIsIdle()
         }
     }
 
