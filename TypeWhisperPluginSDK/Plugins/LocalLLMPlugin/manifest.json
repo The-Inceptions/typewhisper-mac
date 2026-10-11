@@ -1,8 +1,8 @@
 {
     "id": "com.typewhisper.local-llm-mlx",
     "name": "Local LLM (MLX)",
-    "version": "1.0.0",
-    "minHostVersion": "1.7.0",
+    "version": "1.0.1",
+    "minHostVersion": "1.8.0",
     "sdkCompatibilityVersion": "v1",
     "supportedArchitectures": [
         "arm64"
