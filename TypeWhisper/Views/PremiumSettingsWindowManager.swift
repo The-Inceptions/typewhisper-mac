@@ -7,6 +7,7 @@ enum PremiumSettingsDestination: String, CaseIterable, Hashable, Sendable {
     case correctionLearning
     case cloudSync
     case speakerWorkspace
+    case pairedDevices
 }
 
 @MainActor
@@ -22,6 +23,7 @@ struct PremiumSettingsWindowDefinition {
     let minimumSize: CGSize
     let accessibilityIdentifier: String
     let content: AnyView
+    var onClose: (@MainActor () -> Void)? = nil
 }
 
 @MainActor
@@ -33,6 +35,7 @@ struct PremiumSettingsWindowFactories {
     let correctionLearning: Factory
     let cloudSync: Factory
     let speakerWorkspace: Factory
+    let pairedDevices: Factory
 
     func makeDefinition(
         for destination: PremiumSettingsDestination
@@ -48,6 +51,8 @@ struct PremiumSettingsWindowFactories {
             cloudSync()
         case .speakerWorkspace:
             speakerWorkspace()
+        case .pairedDevices:
+            pairedDevices()
         }
     }
 
@@ -140,6 +145,28 @@ struct PremiumSettingsWindowFactories {
                         )
                     )
                 )
+            },
+            pairedDevices: {
+                PremiumSettingsWindowDefinition(
+                    title: PairedDevicesPremiumCopy.title,
+                    preferredSize: CGSize(width: 600, height: 620),
+                    minimumSize: CGSize(width: 520, height: 460),
+                    accessibilityIdentifier: "premium.window.pairedDevices",
+                    content: AnyView(
+                        PremiumPairedDevicesSettingsWindow(
+                            licenseService: .shared,
+                            premiumAccount: ServiceContainer.shared.premiumAccountService,
+                            onManageAccess: {
+                                PremiumSettingsWindowManager.shared.present(.access)
+                            }
+                        )
+                    ),
+                    // The window is kept after closing, so its view does not
+                    // disappear; an open pairing must not outlive it.
+                    onClose: {
+                        ServiceContainer.shared.remoteLinkViewModel.endPairing()
+                    }
+                )
             }
         )
     }
@@ -209,6 +236,7 @@ final class PremiumSettingsWindowManager: PremiumSettingsWindowPresenting {
         window.setFrameAutosaveName(autosaveName)
 
         let delegate = PremiumSettingsWindowDelegate(destination: destination) { [weak self] destination in
+            definition.onClose?()
             self?.windows[destination] = nil
             self?.delegates[destination] = nil
         }
@@ -315,6 +343,41 @@ struct PremiumCalendarMeetingSettingsWindow: View {
 }
 
 @MainActor
+private struct PremiumPairedDevicesSettingsWindow: View {
+    @ObservedObject private var license: LicenseService
+    @ObservedObject private var premiumAccount: PremiumAccountService
+    private let onManageAccess: () -> Void
+
+    init(
+        licenseService: LicenseService,
+        premiumAccount: PremiumAccountService,
+        onManageAccess: @escaping () -> Void
+    ) {
+        self.license = licenseService
+        self.premiumAccount = premiumAccount
+        self.onManageAccess = onManageAccess
+    }
+
+    var body: some View {
+        if CalendarMeetingPremiumAccess.isGranted(
+            hasCommercialLicense: license.hasCommercialLicense,
+            hasPremiumEntitlement: premiumAccount.hasPremiumEntitlement
+        ) {
+            RemoteLinkSettingsView()
+        } else {
+            PremiumLockedDetailView(
+                message: localizedAppText(
+                    "Using this Mac from your iPhone or iPad is part of TypeWhisper Premium.",
+                    de: "Diesen Mac vom iPhone oder iPad aus zu nutzen, ist Teil von TypeWhisper Premium.",
+                    ja: "iPhone や iPad からこの Mac を使う機能は TypeWhisper Premium に含まれます。",
+                    zh: "从 iPhone 或 iPad 使用这台 Mac 是 TypeWhisper Premium 的功能。"
+                ),
+                onManageAccess: onManageAccess
+            )
+        }
+    }
+}
+
 private struct PremiumSpeakerSettingsWindow: View {
     @ObservedObject private var license: LicenseService
     @ObservedObject private var premiumAccount: PremiumAccountService

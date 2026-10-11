@@ -52,6 +52,10 @@ final class SettingsNavigationCoordinator: ObservableObject {
             navigate(to: .history)
         case .speakerWorkspace:
             navigate(to: .speakers)
+        case .pairedDevices:
+            // Paired devices have no other Settings page, so their Premium
+            // window is where the settings live.
+            PremiumSettingsWindowManager.shared.present(.pairedDevices)
         }
     }
 
