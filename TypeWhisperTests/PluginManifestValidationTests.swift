@@ -141,20 +141,21 @@ final class PluginManifestValidationTests: XCTestCase {
         XCTAssertEqual(manifest.supportedArchitectures, ["arm64"])
     }
 
-    func testMLXStoragePluginReleasesRequireHost17() throws {
+    func testMLXStoragePluginReleasesRequireCompatibleHost() throws {
         let manifestExpectations = [
-            ("TypeWhisperPluginSDK/Plugins/Qwen3Plugin/manifest.json", "1.1.10"),
-            ("TypeWhisperPluginSDK/Plugins/VoxtralPlugin/manifest.json", "1.0.16"),
-            ("TypeWhisperPluginSDK/Plugins/GranitePlugin/manifest.json", "1.0.12"),
-            ("TypeWhisperPluginSDK/Plugins/LocalLLMPlugin/manifest.json", "1.0.0"),
+            ("TypeWhisperPluginSDK/Plugins/Qwen3Plugin/manifest.json", "1.1.11", "1.8.0"),
+            ("TypeWhisperPluginSDK/Plugins/CanaryPlugin/manifest.json", "1.0.2", "1.8.0"),
+            ("TypeWhisperPluginSDK/Plugins/VoxtralPlugin/manifest.json", "1.0.16", "1.7.0"),
+            ("TypeWhisperPluginSDK/Plugins/GranitePlugin/manifest.json", "1.0.12", "1.7.0"),
+            ("TypeWhisperPluginSDK/Plugins/LocalLLMPlugin/manifest.json", "1.0.1", "1.8.0"),
         ]
 
-        for (relativePath, expectedVersion) in manifestExpectations {
+        for (relativePath, expectedVersion, expectedMinHostVersion) in manifestExpectations {
             let manifestURL = TestSupport.repoRoot.appendingPathComponent(relativePath)
             let data = try Data(contentsOf: manifestURL)
             let manifest = try JSONDecoder().decode(PluginManifest.self, from: data)
             XCTAssertEqual(manifest.version, expectedVersion, relativePath)
-            XCTAssertEqual(manifest.minHostVersion, "1.7.0", relativePath)
+            XCTAssertEqual(manifest.minHostVersion, expectedMinHostVersion, relativePath)
         }
     }
 
