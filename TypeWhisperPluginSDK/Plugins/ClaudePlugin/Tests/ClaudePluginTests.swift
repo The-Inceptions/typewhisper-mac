@@ -1143,6 +1143,79 @@ final class ClaudePluginTests: XCTestCase {
         XCTAssertEqual(reactivated.promptCache, .oneHour)
     }
 
+    // MARK: - Refusal fallback
+
+    func testRefusalFallbackIsRequestedForTheSupportedModels() async throws {
+        for model in ["claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5", "claude-fable-5-1"] {
+            let request = try await Self.capturedRequest(model: model)
+            let body = try Self.jsonBody(from: request)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "anthropic-beta"), "server-side-fallback-2026-07-01", model)
+            XCTAssertEqual(body["fallbacks"] as? String, "default", model)
+            PluginHTTPClientTestHarness.reset()
+        }
+    }
+
+    func testRefusalFallbackIsNotSentToOtherModels() async throws {
+        for model in ["claude-haiku-5-5", "claude-sonnet-5", "claude-opus-4-8", "claude-fable-5"] {
+            let request = try await Self.capturedRequest(model: model)
+            let body = try Self.jsonBody(from: request)
+            XCTAssertNil(request.value(forHTTPHeaderField: "anthropic-beta"), model)
+            XCTAssertNil(body["fallbacks"], model)
+            PluginHTTPClientTestHarness.reset()
+        }
+    }
+
+    func testRefusalFallbackCanBeTurnedOff() async throws {
+        let request = try await Self.capturedRequest(model: "claude-opus-5-5", defaults: ["refusalFallback": false])
+        let body = try Self.jsonBody(from: request)
+        XCTAssertNil(request.value(forHTTPHeaderField: "anthropic-beta"))
+        XCTAssertNil(body["fallbacks"])
+    }
+
+    func testFallbackBlocksAreNotTreatedAsText() async throws {
+        let host = try PluginTestHostServices()
+        let plugin = ClaudePlugin()
+        plugin.activate(host: host) // no key on host → no background model refresh
+        plugin.setApiKey("claude-key")
+
+        let body = #"""
+        {"model":"claude-opus-4-8","stop_reason":"end_turn","content":[
+            {"type":"fallback","from":{"model":"claude-opus-5-5"},"to":{"model":"claude-opus-4-8"}},
+            {"type":"text","text":"Fixed text."}
+        ]}
+        """#
+        let store = PluginHTTPClientSessionStore()
+        PluginHTTPClientTestHarness.configure { _ in
+            store.makeSession(outcomes: [
+                .success(Data(body.utf8), Self.httpResponse(url: Self.messagesURL, statusCode: 200)),
+            ])
+        }
+
+        let reply = try await plugin.process(systemPrompt: "sys", userText: "hi", model: "claude-opus-5-5")
+        XCTAssertEqual(reply, "Fixed text.")
+        let summary = try XCTUnwrap(plugin.lastRequestSummary)
+        XCTAssertEqual(summary.model, "claude-opus-4-8")
+        XCTAssertEqual(summary.declinedModel, "claude-opus-5-5")
+    }
+
+    func testRejectedFallbackBetaPointsAtTheToggle() async throws {
+        let error = try await Self.processError(
+            outcomes: [
+                .success(
+                    Self.errorBody(
+                        type: "invalid_request_error",
+                        message: "Unexpected value(s) `server-side-fallback-2026-07-01` for the `anthropic-beta` header."
+                    ),
+                    Self.httpResponse(url: Self.messagesURL, statusCode: 400)
+                ),
+            ],
+            model: "claude-opus-5-5"
+        )
+        let message = Self.apiErrorMessage(error)
+        XCTAssertTrue(message.contains("Turn off “Retry declined requests on a fallback model”"), message)
+        XCTAssertTrue(message.contains("refusal fallback"), message)
+    }
+
     // MARK: - Helpers
 
     private static func waitForRefreshWaiterCount(_ expectedCount: Int, plugin: ClaudePlugin) async {

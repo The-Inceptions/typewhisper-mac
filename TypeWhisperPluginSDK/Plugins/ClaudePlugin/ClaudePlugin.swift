@@ -26,6 +26,17 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
     private static let cachedModelsKey = "fetchedLLMModels.v1"
     private static let reasoningEffortKey = "reasoningEffort"
     private static let promptCacheKey = "promptCacheTTL"
+    private static let refusalFallbackKey = "refusalFallback"
+    /// Models that accept `fallbacks: "default"`: when a safety classifier
+    /// declines, Anthropic re-runs the request on a fallback model in the same
+    /// call. Claude Haiku 5.5 has no server-side fallback.
+    nonisolated static let refusalFallbackModels: Set<String> = [
+        "claude-opus-5-5",
+        "claude-opus-5",
+        "claude-sonnet-5-5",
+        "claude-fable-5-1",
+    ]
+    nonisolated static let refusalFallbackBeta = "server-side-fallback-2026-07-01"
     /// Serve a cached model list without re-fetching for 24 hours.
     private static let cacheTTL: TimeInterval = 24 * 60 * 60
     /// Safety bound on pagination so a misbehaving `has_more` never loops forever.
@@ -52,6 +63,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
         /// Saved `output_config.effort`; empty means the model's own default.
         var reasoningEffortId = ""
         var promptCache = ClaudePromptCache.fiveMinutes
+        var refusalFallbackEnabled = true
         var lastRequestSummary: ClaudeRequestSummary?
         var modelCache: ClaudeModelCache?
         var refreshGeneration: UInt64 = 0
@@ -66,6 +78,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
         let temperatureDirective: PluginLLMTemperatureDirective
         let reasoningEffortId: String
         let promptCache: ClaudePromptCache
+        let refusalFallbackEnabled: Bool
         let modelCache: ClaudeModelCache?
     }
 
@@ -101,6 +114,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
         ) ?? ""
         let promptCache = (host.userDefault(forKey: Self.promptCacheKey) as? String)
             .flatMap(ClaudePromptCache.init(rawValue:)) ?? .fiveMinutes
+        let refusalFallbackEnabled = host.userDefault(forKey: Self.refusalFallbackKey) as? Bool ?? true
 
         let previousTask = state.withLock { state -> Task<Bool, Never>? in
             let previousTask = state.inFlightModelRefresh?.task
@@ -112,6 +126,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
             state.llmTemperatureValue = llmTemperatureValue
             state.reasoningEffortId = reasoningEffortId
             state.promptCache = promptCache
+            state.refusalFallbackEnabled = refusalFallbackEnabled
             state.modelCache = modelCache
             state.refreshGeneration &+= 1
             state.inFlightModelRefresh = nil
@@ -243,6 +258,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
                 ),
                 reasoningEffortId: state.reasoningEffortId,
                 promptCache: state.promptCache,
+                refusalFallbackEnabled: state.refusalFallbackEnabled,
                 modelCache: state.modelCache
             )
         }
@@ -256,6 +272,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
             requestedEffort: Self.normalizedEffortId(effort) ?? Self.normalizedEffortId(snapshot.reasoningEffortId),
             temperature: resolvedTemperature,
             promptCache: snapshot.promptCache,
+            refusalFallbackEnabled: snapshot.refusalFallbackEnabled,
             metadata: snapshot.modelCache?.models.first { $0.id == modelId }
         )
         return try await callMessagesAPI(
@@ -325,6 +342,18 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
             return state.host
         }
         host?.setUserDefault(promptCache.rawValue, forKey: Self.promptCacheKey)
+    }
+
+    // MARK: - Refusal Fallback
+
+    var refusalFallbackEnabled: Bool { state.withLock { $0.refusalFallbackEnabled } }
+
+    func setRefusalFallbackEnabled(_ enabled: Bool) {
+        let host = state.withLock { state -> HostServices? in
+            state.refusalFallbackEnabled = enabled
+            return state.host
+        }
+        host?.setUserDefault(enabled, forKey: Self.refusalFallbackKey)
     }
 
     /// Token usage of the last answered request; shows whether caching works.
@@ -852,6 +881,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
         requestedEffort: String?,
         temperature: Double?,
         promptCache: ClaudePromptCache = .off,
+        refusalFallbackEnabled: Bool = false,
         metadata: ClaudeFetchedModel?
     ) -> ClaudeRequestContext {
         let capabilities = capabilities(for: model, metadata: metadata)
@@ -869,6 +899,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
             adaptiveThinking: adaptiveThinking,
             temperature: acceptsTemperature ? temperature : nil,
             promptCache: promptCache,
+            refusalFallback: refusalFallbackEnabled && refusalFallbackModels.contains(model.lowercased()),
             maxTokens: min(defaultMaxOutputTokens, capabilities.maxOutputTokens ?? defaultMaxOutputTokens),
             timeout: requestTimeout(forEffort: effort ?? capabilities.defaultEffort)
         )
@@ -907,6 +938,9 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
         if let temperature = context.temperature {
             body["temperature"] = temperature
         }
+        if context.refusalFallback {
+            body["fallbacks"] = "default"
+        }
         return body
     }
 
@@ -925,6 +959,9 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
         request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         request.setValue(Self.anthropicVersion, forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if context.refusalFallback {
+            request.setValue(Self.refusalFallbackBeta, forHTTPHeaderField: "anthropic-beta")
+        }
         request.timeoutInterval = context.timeout
         request.httpBody = try JSONSerialization.data(
             withJSONObject: Self.messagesRequestBody(systemPrompt: systemPrompt, userText: userText, context: context)
@@ -982,9 +1019,14 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
             cache write \(usage?.cacheCreationInputTokens ?? 0), output \(usage?.outputTokens ?? 0)]
             """
         )
+        let declinedModel = decoded.declinedModels.first
+        if let declinedModel {
+            Self.logger.info("Refusal fallback: \(declinedModel, privacy: .public) declined, \(decoded.model ?? "-", privacy: .public) answered")
+        }
         let summary = ClaudeRequestSummary(
             date: Date(),
             model: decoded.model ?? model,
+            declinedModel: declinedModel,
             inputTokens: usage?.inputTokens ?? 0,
             cacheReadInputTokens: usage?.cacheReadInputTokens ?? 0,
             cacheCreationInputTokens: usage?.cacheCreationInputTokens ?? 0,
@@ -1076,7 +1118,13 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
         switch statusCode {
         case 400:
             headline = "Claude rejected the request"
-            advice = "Check the selected model, reasoning effort and temperature in the Claude plugin settings."
+            if context?.refusalFallback == true,
+               providerMessage.localizedCaseInsensitiveContains("fallback")
+                || providerMessage.localizedCaseInsensitiveContains("anthropic-beta") {
+                advice = "Turn off “Retry declined requests on a fallback model” in the Claude plugin settings."
+            } else {
+                advice = "Check the selected model, reasoning effort and temperature in the Claude plugin settings."
+            }
         case 401:
             headline = "Anthropic rejected the API key"
             advice = "Check or replace the key in Settings › Integrations › Claude."
@@ -1250,6 +1298,8 @@ struct ClaudeRequestContext: Sendable {
     let adaptiveThinking: Bool
     let temperature: Double?
     let promptCache: ClaudePromptCache
+    /// Send `fallbacks: "default"` with the server-side fallback beta.
+    let refusalFallback: Bool
     let maxTokens: Int
     let timeout: TimeInterval
 
@@ -1260,6 +1310,9 @@ struct ClaudeRequestContext: Sendable {
         }
         if promptCache != .off {
             items.append("cache \(promptCache.rawValue)")
+        }
+        if refusalFallback {
+            items.append("refusal fallback")
         }
         return items
     }
@@ -1287,6 +1340,8 @@ struct ClaudeRequestSummary: Sendable, Equatable {
     let date: Date
     /// The model that answered.
     let model: String
+    /// The model whose refusal handed the request to `model`, if any.
+    let declinedModel: String?
     let inputTokens: Int
     let cacheReadInputTokens: Int
     let cacheCreationInputTokens: Int
@@ -1347,8 +1402,27 @@ private struct ClaudeAPIErrorEnvelope: Decodable {
 /// never just the first content block.
 struct ClaudeMessagesResponse: Decodable {
     struct ContentBlock: Decodable {
+        struct ModelReference: Decodable {
+            let model: String?
+        }
+
         let type: String
         let text: String?
+        /// On `fallback` blocks: the model that declined and the one that took over.
+        let from: ModelReference?
+        let to: ModelReference?
+
+        enum CodingKeys: String, CodingKey {
+            case type, text, from, to
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            type = try container.decode(String.self, forKey: .type)
+            text = try? container.decodeIfPresent(String.self, forKey: .text)
+            from = try? container.decodeIfPresent(ModelReference.self, forKey: .from)
+            to = try? container.decodeIfPresent(ModelReference.self, forKey: .to)
+        }
     }
 
     /// Populated when `stop_reason` is `refusal`.
@@ -1396,7 +1470,13 @@ struct ClaudeMessagesResponse: Decodable {
         usage = try? container.decodeIfPresent(Usage.self, forKey: .usage)
     }
 
-    /// The joined text blocks; `thinking` and `redacted_thinking` blocks are skipped.
+    /// Models that declined before a server-side fallback answered.
+    var declinedModels: [String] {
+        content.filter { $0.type == "fallback" }.compactMap { $0.from?.model }
+    }
+
+    /// The joined text blocks; `thinking`, `redacted_thinking` and `fallback`
+    /// blocks are skipped.
     var replyText: String {
         content
             .filter { $0.type == "text" }
@@ -1532,6 +1612,7 @@ private struct ClaudeSettingsView: View {
     @State private var refreshErrorMessage: String?
     @State private var reasoningEffortId = ""
     @State private var promptCache: ClaudePromptCache = .fiveMinutes
+    @State private var refusalFallbackEnabled = true
     @State private var isAdvancedExpanded = false
     private let bundle = Bundle(for: ClaudePlugin.self)
 
@@ -1722,6 +1803,7 @@ private struct ClaudeSettingsView: View {
             llmTemperatureValue = plugin.llmTemperatureValue
             reasoningEffortId = plugin.reasoningEffortId
             promptCache = plugin.promptCache
+            refusalFallbackEnabled = plugin.refusalFallbackEnabled
             lastUpdated = plugin.cacheLastUpdated
             // Serve the cache immediately; refresh in the background if stale.
             if plugin.isAvailable,
@@ -1744,6 +1826,7 @@ private struct ClaudeSettingsView: View {
         VStack(alignment: .leading, spacing: 12) {
             reasoningEffortSettings
             promptCacheSettings
+            refusalFallbackSettings
             lastRequestSummary
         }
     }
@@ -1767,6 +1850,20 @@ private struct ClaudeSettingsView: View {
         }
     }
 
+    private var refusalFallbackSettings: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle(String(localized: "Retry declined requests on a fallback model", bundle: bundle), isOn: $refusalFallbackEnabled)
+                .onChange(of: refusalFallbackEnabled) {
+                    plugin.setRefusalFallbackEnabled(refusalFallbackEnabled)
+                }
+
+            Text("Applies to Claude Opus 5.5, Opus 5, Sonnet 5.5 and Fable 5.1. If Anthropic's safety checks decline a request, a fallback model answers it in the same call, billed at that model's rates.", bundle: bundle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     /// Refreshes while visible so a dictation made with the settings open shows up.
     private var lastRequestSummary: some View {
         TimelineView(.periodic(from: .now, by: 2)) { _ in
@@ -1774,7 +1871,7 @@ private struct ClaudeSettingsView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Last Request", bundle: bundle)
                         .font(.caption.weight(.semibold))
-                    Text(verbatim: "\(summary.date.formatted(date: .omitted, time: .shortened)) · \(summary.model)")
+                    Text(verbatim: "\(summary.date.formatted(date: .omitted, time: .shortened)) · \(answeredBy(summary))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Text("Cache: \(summary.cacheReadInputTokens) read, \(summary.cacheCreationInputTokens) written · Input: \(summary.inputTokens) · Output: \(summary.outputTokens) tokens", bundle: bundle)
@@ -1829,6 +1926,11 @@ private struct ClaudeSettingsView: View {
                 }
             }
         }
+    }
+
+    private func answeredBy(_ summary: ClaudeRequestSummary) -> String {
+        guard let declinedModel = summary.declinedModel else { return summary.model }
+        return String(localized: "\(summary.model) (fallback after \(declinedModel) declined)", bundle: bundle)
     }
 
     private var modelDefaultEffortLabel: String {

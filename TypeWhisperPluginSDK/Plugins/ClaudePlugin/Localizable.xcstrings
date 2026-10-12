@@ -836,6 +836,72 @@
           }
         }
       }
+    },
+    "Retry declined requests on a fallback model": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "拒否されたリクエストを代替モデルで再試行"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Abgelehnte Anfragen mit einem Ersatzmodell wiederholen"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "使用备用模型重试被拒绝的请求"
+          }
+        }
+      }
+    },
+    "Applies to Claude Opus 5.5, Opus 5, Sonnet 5.5 and Fable 5.1. If Anthropic's safety checks decline a request, a fallback model answers it in the same call, billed at that model's rates.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Claude Opus 5.5、Opus 5、Sonnet 5.5、Fable 5.1 に適用されます。Anthropic の安全チェックがリクエストを拒否した場合、同じ呼び出しの中で代替モデルが回答し、そのモデルの料金で課金されます。"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Gilt für Claude Opus 5.5, Opus 5, Sonnet 5.5 und Fable 5.1. Lehnen die Sicherheitsprüfungen von Anthropic eine Anfrage ab, beantwortet sie ein Ersatzmodell im selben Aufruf, abgerechnet zu den Preisen dieses Modells."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "适用于 Claude Opus 5.5、Opus 5、Sonnet 5.5 和 Fable 5.1。如果 Anthropic 的安全检查拒绝了请求，将在同一次调用中由备用模型回答，并按该模型的价格计费。"
+          }
+        }
+      }
+    },
+    "%@ (fallback after %@ declined)": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@（%2$@ が拒否したため代替）"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@ (Ersatz, nachdem %2$@ abgelehnt hat)"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$@（%2$@ 拒绝后的备用模型）"
+          }
+        }
+      }
     }
   },
   "version": "1.0"
