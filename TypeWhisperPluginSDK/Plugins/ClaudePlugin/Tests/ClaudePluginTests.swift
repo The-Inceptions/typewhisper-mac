@@ -805,7 +805,10 @@ final class ClaudePluginTests: XCTestCase {
     }
 
     func testTimeoutBecomesNetworkErrorWithTheTimeout() async throws {
-        let error = try await Self.processError(outcomes: [.failure(URLError(.timedOut))])
+        let error = try await Self.processError(
+            outcomes: [.failure(URLError(.timedOut))],
+            model: "claude-haiku-4-5"
+        )
         guard case .networkError(let message)? = error as? PluginChatError else {
             return XCTFail("Expected PluginChatError.networkError, got \(error)")
         }
@@ -874,6 +877,185 @@ final class ClaudePluginTests: XCTestCase {
         let failure = try XCTUnwrap(plugin.lastModelRefreshFailure)
         XCTAssertNil(failure.statusCode)
         XCTAssertTrue(failure.message.hasPrefix("This Mac is offline"), failure.message)
+    }
+
+    func testTimeoutMessageNamesTheReasoningEffort() async throws {
+        let error = try await Self.processError(
+            outcomes: [.failure(URLError(.timedOut))],
+            model: "claude-opus-4-8",
+            effort: "xhigh"
+        )
+        guard case .networkError(let message)? = error as? PluginChatError else {
+            return XCTFail("Expected PluginChatError.networkError, got \(error)")
+        }
+        XCTAssertTrue(message.hasPrefix("Anthropic didn't answer within 180 s at reasoning effort xhigh."), message)
+        XCTAssertTrue(message.contains("model claude-opus-4-8 · effort xhigh"), message)
+    }
+
+    // MARK: - Reasoning effort
+
+    func testEffortSendsAdaptiveThinkingAndDropsTemperature() async throws {
+        let request = try await Self.capturedRequest(
+            model: "claude-sonnet-4-6",
+            effort: "high",
+            defaults: [
+                "llmTemperatureMode": PluginLLMTemperatureMode.custom.rawValue,
+                "llmTemperatureValue": 0.7,
+            ]
+        )
+        let body = try Self.jsonBody(from: request)
+        XCTAssertEqual(Self.effort(in: body), "high")
+        XCTAssertEqual(Self.thinkingType(in: body), "adaptive")
+        XCTAssertNil(body["temperature"], "Claude 4.6 models reject a custom temperature while thinking")
+        XCTAssertEqual(body["max_tokens"] as? Int, 16_000)
+        XCTAssertEqual(request.timeoutInterval, 120)
+    }
+
+    func testWithoutEffortTheRequestKeepsModelDefaults() async throws {
+        let request = try await Self.capturedRequest(
+            model: "claude-sonnet-4-6",
+            defaults: [
+                "llmTemperatureMode": PluginLLMTemperatureMode.custom.rawValue,
+                "llmTemperatureValue": 0.7,
+            ]
+        )
+        let body = try Self.jsonBody(from: request)
+        XCTAssertNil(body["output_config"])
+        XCTAssertNil(body["thinking"])
+        XCTAssertEqual(body["temperature"] as? Double, 0.7)
+    }
+
+    func testSavedEffortAppliesWhenTheHostSendsNone() async throws {
+        let request = try await Self.capturedRequest(model: "claude-opus-4-8", defaults: ["reasoningEffort": "low"])
+        let body = try Self.jsonBody(from: request)
+        XCTAssertEqual(Self.effort(in: body), "low")
+        XCTAssertEqual(Self.thinkingType(in: body), "adaptive")
+        XCTAssertEqual(request.timeoutInterval, 60)
+    }
+
+    func testHostEffortOverridesTheSavedEffort() async throws {
+        let request = try await Self.capturedRequest(
+            model: "claude-opus-4-8",
+            effort: "max",
+            defaults: ["reasoningEffort": "low"]
+        )
+        let body = try Self.jsonBody(from: request)
+        XCTAssertEqual(Self.effort(in: body), "max")
+        XCTAssertEqual(request.timeoutInterval, 300)
+    }
+
+    func testEffortTheModelLacksFallsBackToTheModelDefault() async throws {
+        let request = try await Self.capturedRequest(model: "claude-opus-4-6", defaults: ["reasoningEffort": "xhigh"])
+        let body = try Self.jsonBody(from: request)
+        XCTAssertNil(body["output_config"], "Opus 4.6 has no xhigh, so the model default applies")
+        XCTAssertNil(body["thinking"])
+    }
+
+    func testOpus45SendsEffortWithoutAdaptiveThinking() async throws {
+        let body = try Self.jsonBody(from: await Self.capturedRequest(model: "claude-opus-4-5", effort: "medium"))
+        XCTAssertEqual(Self.effort(in: body), "medium")
+        XCTAssertNil(body["thinking"], "adaptive thinking is a 400 on Opus 4.5")
+    }
+
+    func testModelsWithoutEffortNeverSendIt() async throws {
+        let body = try Self.jsonBody(from: await Self.capturedRequest(model: "claude-haiku-4-5", effort: "high"))
+        XCTAssertNil(body["output_config"])
+        XCTAssertNil(body["thinking"])
+    }
+
+    func testClaude3KeepsItsSmallerOutputLimit() async throws {
+        let body = try Self.jsonBody(from: await Self.capturedRequest(model: "claude-3-haiku-20240307"))
+        XCTAssertEqual(body["max_tokens"] as? Int, 4_096)
+    }
+
+    func testSupportedEffortsFollowTheStaticTable() throws {
+        let host = try PluginTestHostServices()
+        let plugin = ClaudePlugin()
+        plugin.activate(host: host)
+
+        XCTAssertEqual(plugin.supportedEfforts(for: "claude-opus-4-6").map(\.id), ["low", "medium", "high", "max"])
+        XCTAssertEqual(plugin.supportedEfforts(for: "claude-sonnet-5").map(\.id), ["low", "medium", "high", "xhigh", "max"])
+        XCTAssertEqual(plugin.supportedEfforts(for: "claude-opus-4-5-20251101").map(\.id), ["low", "medium", "high"])
+        XCTAssertTrue(plugin.supportedEfforts(for: "claude-haiku-4-5").isEmpty)
+        XCTAssertEqual(plugin.defaultEffortId(for: "claude-opus-5-5"), "medium")
+        XCTAssertEqual(plugin.defaultEffortId(for: "claude-sonnet-5-5"), "high")
+        XCTAssertNil(plugin.defaultEffortId(for: "claude-haiku-4-5"))
+    }
+
+    func testDefaultEffortIdReportsTheSavedEffortWhenTheModelHasIt() throws {
+        let host = try PluginTestHostServices(defaults: ["reasoningEffort": "xhigh"])
+        let plugin = ClaudePlugin()
+        plugin.activate(host: host)
+
+        XCTAssertEqual(plugin.defaultEffortId(for: "claude-opus-4-8"), "xhigh")
+        XCTAssertEqual(
+            plugin.defaultEffortId(for: "claude-opus-4-6"),
+            "high",
+            "Opus 4.6 has no xhigh, so a request without an effort uses the model default"
+        )
+        XCTAssertEqual(plugin.modelDefaultEffortId(for: "claude-opus-4-8"), "high")
+    }
+
+    func testSettingTheEffortPersistsItAndNotifiesTheHost() throws {
+        let host = try PluginTestHostServices()
+        let plugin = ClaudePlugin()
+        plugin.activate(host: host)
+        let notificationsBefore = host.capabilitiesChangedCount
+
+        plugin.setReasoningEffort(" XHigh ")
+        XCTAssertEqual(plugin.reasoningEffortId, "xhigh")
+        XCTAssertEqual(host.userDefault(forKey: "reasoningEffort") as? String, "xhigh")
+        XCTAssertEqual(host.capabilitiesChangedCount, notificationsBefore + 1)
+
+        plugin.setReasoningEffort("xhigh")
+        XCTAssertEqual(host.capabilitiesChangedCount, notificationsBefore + 1, "an unchanged value must not notify again")
+    }
+
+    func testModelsAPICapabilitiesOverrideTheStaticTable() async throws {
+        let page = Data(#"""
+        {"data":[
+          {"id":"claude-next","display_name":"Claude Next","created_at":"2026-09-01T00:00:00Z","type":"model",
+           "max_tokens":8192,
+           "capabilities":{"thinking":{"supported":true,"types":{"adaptive":{"supported":true}}},
+                           "effort":{"supported":true,"low":{"supported":true},"medium":{"supported":false},
+                                     "high":{"supported":true},"xhigh":{"supported":false},"max":{"supported":true}}}},
+          {"id":"claude-odd","display_name":"Odd","created_at":"2026-01-01T00:00:00Z","type":"model",
+           "max_tokens":"lots","capabilities":{"effort":"yes"}}
+        ],"has_more":false}
+        """#.utf8)
+        let decoded = try ClaudePlugin.decodeModelsPage(from: page)
+        let next = try XCTUnwrap(decoded.models.first { $0.id == "claude-next" })
+        XCTAssertEqual(next.effortLevels, ["low", "high", "max"])
+        XCTAssertEqual(next.supportsAdaptiveThinking, true)
+        XCTAssertEqual(next.maxOutputTokens, 8192)
+        let odd = try XCTUnwrap(
+            decoded.models.first { $0.id == "claude-odd" },
+            "an unexpected capability shape must not drop the model"
+        )
+        XCTAssertNil(odd.effortLevels)
+        XCTAssertNil(odd.maxOutputTokens)
+
+        let request = try await Self.capturedRequest(
+            model: "claude-next",
+            effort: "high",
+            cache: ClaudeModelCache(models: decoded.models, fetchedAt: Date())
+        )
+        let body = try Self.jsonBody(from: request)
+        XCTAssertEqual(Self.effort(in: body), "high")
+        XCTAssertEqual(Self.thinkingType(in: body), "adaptive")
+        XCTAssertEqual(body["max_tokens"] as? Int, 8192, "max_tokens is clamped to the model's output limit")
+    }
+
+    func testCachesWrittenByPluginOnePointOneStillDecode() throws {
+        let legacy = Data(#"{"models":[{"id":"claude-opus-4-8","displayName":"Claude Opus 4.8","createdAt":1000}],"fetchedAt":0}"#.utf8)
+        let cache = try JSONDecoder().decode(ClaudeModelCache.self, from: legacy)
+        let model = try XCTUnwrap(cache.models.first)
+        XCTAssertNil(model.effortLevels)
+        XCTAssertEqual(
+            ClaudePlugin.capabilities(for: model.id, metadata: model).effortLevels,
+            ["low", "medium", "high", "xhigh", "max"],
+            "without metadata the static table applies"
+        )
     }
 
     // MARK: - Helpers
@@ -947,10 +1129,50 @@ final class ClaudePluginTests: XCTestCase {
         return try! JSONSerialization.data(withJSONObject: body)
     }
 
+    /// Sends one request and returns the URLRequest the plugin built.
+    private static func capturedRequest(
+        model: String,
+        effort: String? = nil,
+        defaults: [String: Any] = [:],
+        cache: ClaudeModelCache? = nil
+    ) async throws -> URLRequest {
+        var defaults = defaults
+        if let cache {
+            defaults[cachedModelsKey] = try JSONEncoder().encode(cache)
+        }
+        let host = try PluginTestHostServices(defaults: defaults)
+        let plugin = ClaudePlugin()
+        plugin.activate(host: host) // no key on host → no background model refresh
+        plugin.setApiKey("claude-key")
+        let store = PluginHTTPClientSessionStore()
+        PluginHTTPClientTestHarness.configure { _ in
+            store.makeSession(outcomes: [
+                .success(messagesResponse(text: "ok"), httpResponse(url: messagesURL, statusCode: 200)),
+            ])
+        }
+        _ = try await plugin.process(
+            systemPrompt: "sys",
+            userText: "hi",
+            model: model,
+            temperatureDirective: .inheritProviderSetting,
+            effort: effort
+        )
+        return try XCTUnwrap(store.sessions.first?.requestedRequests.first)
+    }
+
+    private static func effort(in body: [String: Any]) -> String? {
+        (body["output_config"] as? [String: Any])?["effort"] as? String
+    }
+
+    private static func thinkingType(in body: [String: Any]) -> String? {
+        (body["thinking"] as? [String: Any])?["type"] as? String
+    }
+
     /// Runs one Messages request against `outcomes` and returns the thrown error.
     private static func processError(
         outcomes: [PluginHTTPClientTestOutcome],
-        model: String = "claude-sonnet-4-6"
+        model: String = "claude-sonnet-4-6",
+        effort: String? = nil
     ) async throws -> Error {
         let host = try PluginTestHostServices()
         let plugin = ClaudePlugin()
@@ -961,7 +1183,7 @@ final class ClaudePluginTests: XCTestCase {
             store.makeSession(outcomes: outcomes)
         }
         do {
-            let reply = try await plugin.process(systemPrompt: "sys", userText: "hi", model: model)
+            let reply = try await plugin.process(systemPrompt: "sys", userText: "hi", model: model, effort: effort)
             throw ClaudeTestExpectationError(description: "expected an error, got reply \(reply)")
         } catch let error as ClaudeTestExpectationError {
             throw error

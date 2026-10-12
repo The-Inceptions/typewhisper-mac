@@ -15,7 +15,7 @@ enum ClaudeAutomaticRefreshPolicy {
 // MARK: - Plugin Entry Point
 
 @objc(ClaudePlugin)
-final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllableProvider, LLMModelSelectable, @unchecked Sendable {
+final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortControllableProvider, LLMModelSelectable, @unchecked Sendable {
     static let pluginId = "com.typewhisper.claude"
     static let pluginName = "Claude"
 
@@ -24,14 +24,11 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
     private static let anthropicVersion = "2023-06-01"
     private static let selectedLLMModelKey = "selectedLLMModel"
     private static let cachedModelsKey = "fetchedLLMModels.v1"
+    private static let reasoningEffortKey = "reasoningEffort"
     /// Serve a cached model list without re-fetching for 24 hours.
     private static let cacheTTL: TimeInterval = 24 * 60 * 60
     /// Safety bound on pagination so a misbehaving `has_more` never loops forever.
     private static let maxModelPages = 20
-    /// Output budget for a reply; `stop_reason: max_tokens` turns into an error.
-    private static let maxOutputTokens = 4096
-    /// Non-streaming requests stay idle until the whole reply is ready.
-    private static let messagesTimeout: TimeInterval = 60
     private static let logger = Logger(subsystem: "com.typewhisper.claude", category: "Plugin")
 
     typealias ModelFetchOperation = @Sendable (String) async -> [ClaudeFetchedModel]?
@@ -51,6 +48,8 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
         var selectedLLMModelId: String?
         var llmTemperatureModeRaw = PluginLLMTemperatureMode.providerDefault.rawValue
         var llmTemperatureValue = 0.3
+        /// Saved `output_config.effort`; empty means the model's own default.
+        var reasoningEffortId = ""
         var modelCache: ClaudeModelCache?
         var refreshGeneration: UInt64 = 0
         var inFlightModelRefresh: InFlightModelRefresh?
@@ -62,6 +61,8 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
         let selectedModelId: String?
         let defaultModelId: String
         let temperatureDirective: PluginLLMTemperatureDirective
+        let reasoningEffortId: String
+        let modelCache: ClaudeModelCache?
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
@@ -91,6 +92,9 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
             ?? PluginLLMTemperatureMode.providerDefault.rawValue
         let llmTemperatureValue = host.userDefault(forKey: "llmTemperatureValue") as? Double
             ?? 0.3
+        let reasoningEffortId = Self.normalizedEffortId(
+            host.userDefault(forKey: Self.reasoningEffortKey) as? String
+        ) ?? ""
 
         let previousTask = state.withLock { state -> Task<Bool, Never>? in
             let previousTask = state.inFlightModelRefresh?.task
@@ -100,6 +104,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
             state.selectedLLMModelId = selectedLLMModelId
             state.llmTemperatureModeRaw = llmTemperatureModeRaw
             state.llmTemperatureValue = llmTemperatureValue
+            state.reasoningEffortId = reasoningEffortId
             state.modelCache = modelCache
             state.refreshGeneration &+= 1
             state.inFlightModelRefresh = nil
@@ -175,7 +180,8 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
             systemPrompt: systemPrompt,
             userText: userText,
             model: model,
-            temperatureDirective: .inheritProviderSetting
+            temperatureDirective: .inheritProviderSetting,
+            effort: nil
         )
     }
 
@@ -184,6 +190,39 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
         userText: String,
         model: String?,
         temperatureDirective: PluginLLMTemperatureDirective
+    ) async throws -> String {
+        try await process(
+            systemPrompt: systemPrompt,
+            userText: userText,
+            model: model,
+            temperatureDirective: temperatureDirective,
+            effort: nil
+        )
+    }
+
+    func process(
+        systemPrompt: String,
+        userText: String,
+        model: String?,
+        effort: String?
+    ) async throws -> String {
+        try await process(
+            systemPrompt: systemPrompt,
+            userText: userText,
+            model: model,
+            temperatureDirective: .inheritProviderSetting,
+            effort: effort
+        )
+    }
+
+    /// Every request ends here. A nil `effort` (the host's "Provider Default")
+    /// falls back to the saved reasoning effort, then to the model's default.
+    func process(
+        systemPrompt: String,
+        userText: String,
+        model: String?,
+        temperatureDirective: PluginLLMTemperatureDirective,
+        effort: String?
     ) async throws -> String {
         let snapshot = state.withLock { state -> ProcessingSnapshot in
             let models = Self.baseModels(from: state.modelCache)
@@ -194,7 +233,9 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
                 temperatureDirective: PluginLLMTemperatureDirective(
                     mode: PluginLLMTemperatureMode(rawValue: state.llmTemperatureModeRaw) ?? .providerDefault,
                     value: state.llmTemperatureValue
-                )
+                ),
+                reasoningEffortId: state.reasoningEffortId,
+                modelCache: state.modelCache
             )
         }
         guard let apiKey = snapshot.apiKey, !apiKey.isEmpty else {
@@ -202,13 +243,79 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
         }
         let modelId = model ?? snapshot.selectedModelId ?? snapshot.defaultModelId
         let resolvedTemperature = snapshot.temperatureDirective.resolvedTemperature(applying: temperatureDirective)
+        let context = Self.requestContext(
+            model: modelId,
+            requestedEffort: Self.normalizedEffortId(effort) ?? Self.normalizedEffortId(snapshot.reasoningEffortId),
+            temperature: resolvedTemperature,
+            metadata: snapshot.modelCache?.models.first { $0.id == modelId }
+        )
         return try await callMessagesAPI(
             apiKey: apiKey,
-            model: modelId,
             systemPrompt: systemPrompt,
             userText: userText,
-            temperature: resolvedTemperature
+            context: context
         )
+    }
+
+    // MARK: - LLMEffortControllableProvider
+
+    func supportedEfforts(for model: String?) -> [PluginLLMEffortInfo] {
+        resolvedModel(model).capabilities.effortLevels.map {
+            PluginLLMEffortInfo(id: $0, displayName: Self.effortDisplayName($0))
+        }
+    }
+
+    /// What a request without an explicit effort will use: the saved effort when
+    /// the model supports it, otherwise the model's own default.
+    func defaultEffortId(for model: String?) -> String? {
+        let capabilities = resolvedModel(model).capabilities
+        if let saved = Self.normalizedEffortId(reasoningEffortId), capabilities.effortLevels.contains(saved) {
+            return saved
+        }
+        return capabilities.defaultEffort
+    }
+
+    /// The level the API uses when no effort is sent, for the "Model Default" label.
+    func modelDefaultEffortId(for model: String?) -> String? {
+        resolvedModel(model).capabilities.defaultEffort
+    }
+
+    /// Saved reasoning effort; empty means the model's default.
+    var reasoningEffortId: String { state.withLock { $0.reasoningEffortId } }
+
+    func setReasoningEffort(_ effortId: String) {
+        let normalized = Self.normalizedEffortId(effortId) ?? ""
+        let host = state.withLock { state -> HostServices? in
+            // The settings view echoes the loaded value back on appear.
+            guard state.reasoningEffortId != normalized else { return nil }
+            state.reasoningEffortId = normalized
+            return state.host
+        }
+        host?.setUserDefault(normalized, forKey: Self.reasoningEffortKey)
+        // The host labels its "Provider Default" effort with defaultEffortId(for:).
+        host?.notifyCapabilitiesChanged()
+    }
+
+    /// Whether a custom temperature is dropped: newer models reject sampling
+    /// parameters, older ones reject them while thinking.
+    func ignoresCustomTemperature(for model: String?, reasoningEffortId: String) -> Bool {
+        let resolved = resolvedModel(model)
+        let thinks = Self.normalizedEffortId(reasoningEffortId).map {
+            resolved.capabilities.effortLevels.contains($0) && resolved.capabilities.supportsAdaptiveThinking
+        } ?? false
+        return thinks || Self.modelRejectsSamplingParams(resolved.id)
+    }
+
+    /// `model`, or the model a request without one would use, with its capabilities.
+    private func resolvedModel(_ model: String?) -> (id: String, capabilities: ClaudeModelCapabilities) {
+        let (modelId, metadata) = state.withLock { state -> (String, ClaudeFetchedModel?) in
+            let modelId = model
+                ?? state.selectedLLMModelId
+                ?? Self.baseModels(from: state.modelCache).first?.id
+                ?? Self.fallbackLLMModels[0].id
+            return (modelId, state.modelCache?.models.first { $0.id == modelId })
+        }
+        return (modelId, Self.capabilities(for: modelId, metadata: metadata))
     }
 
     func selectLLMModel(_ modelId: String) {
@@ -567,7 +674,10 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
             ClaudeFetchedModel(
                 id: $0.id,
                 displayName: $0.displayName ?? $0.id,
-                createdAt: parseTimestamp($0.createdAt)
+                createdAt: parseTimestamp($0.createdAt),
+                maxOutputTokens: $0.maxTokens.flatMap { $0 > 0 ? $0 : nil },
+                supportsAdaptiveThinking: $0.capabilities?.thinking?.types?.adaptive?.supported,
+                effortLevels: $0.capabilities?.effort?.supportedLevels
             )
         }
         return (models, decoded.hasMore ?? false, decoded.lastId)
@@ -605,38 +715,175 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
         return !compatiblePrefixes.contains { id.hasPrefix($0) }
     }
 
+    // MARK: - Reasoning Effort
+
+    /// `output_config.effort` levels, lowest first.
+    nonisolated static let effortLadder = ["low", "medium", "high", "xhigh", "max"]
+    /// Room for thinking plus the reply. `max_tokens` doesn't count toward rate
+    /// limits and only generated tokens are billed, so it can be generous.
+    nonisolated static let defaultMaxOutputTokens = 16_000
+
+    nonisolated static func normalizedEffortId(_ raw: String?) -> String? {
+        guard let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !value.isEmpty else { return nil }
+        return value
+    }
+
+    /// Reasoning support for models the Models API metadata doesn't cover: the
+    /// fallback list, caches written by plugin 1.1, or a selection that is no
+    /// longer listed. The first matching row wins, so longer ids come first.
+    nonisolated static func staticCapabilities(for modelId: String) -> ClaudeModelCapabilities {
+        let id = modelId.lowercased()
+        // Claude 3 models cap output at 4,096 tokens; newer ones allow far more.
+        let maxOutputTokens = id.hasPrefix("claude-3-") ? 4_096 : nil
+        let rows: [(prefixes: [String], levels: [String], adaptiveThinking: Bool, defaultEffort: String)] = [
+            (["claude-opus-5-5", "claude-haiku-5-5"], effortLadder, true, "medium"),
+            (
+                ["claude-fable-", "claude-mythos-5", "claude-opus-5", "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7"],
+                effortLadder,
+                true,
+                "high"
+            ),
+            (["claude-opus-4-6", "claude-sonnet-4-6", "claude-mythos-preview"], ["low", "medium", "high", "max"], true, "high"),
+            // Effort without adaptive thinking: `thinking.type.adaptive` is a 400 here.
+            (["claude-opus-4-5"], ["low", "medium", "high"], false, "high"),
+        ]
+        for row in rows where row.prefixes.contains(where: { id.hasPrefix($0) }) {
+            return ClaudeModelCapabilities(
+                effortLevels: row.levels,
+                supportsAdaptiveThinking: row.adaptiveThinking,
+                defaultEffort: row.defaultEffort,
+                maxOutputTokens: maxOutputTokens
+            )
+        }
+        return ClaudeModelCapabilities(
+            effortLevels: [],
+            supportsAdaptiveThinking: false,
+            defaultEffort: nil,
+            maxOutputTokens: maxOutputTokens
+        )
+    }
+
+    /// Models API metadata where present, the static table for the rest.
+    nonisolated static func capabilities(
+        for modelId: String,
+        metadata: ClaudeFetchedModel?
+    ) -> ClaudeModelCapabilities {
+        let fallback = staticCapabilities(for: modelId)
+        guard let metadata else { return fallback }
+        let levels = metadata.effortLevels.map { listed in effortLadder.filter { listed.contains($0) } }
+            ?? fallback.effortLevels
+        let defaultEffort: String?
+        if let known = fallback.defaultEffort, levels.contains(known) {
+            defaultEffort = known
+        } else {
+            // Every model that takes `effort` defaults to high except Opus 5.5 and Haiku 5.5.
+            defaultEffort = levels.contains("high") ? "high" : levels.last
+        }
+        return ClaudeModelCapabilities(
+            effortLevels: levels,
+            supportsAdaptiveThinking: metadata.supportsAdaptiveThinking ?? fallback.supportsAdaptiveThinking,
+            defaultEffort: defaultEffort,
+            maxOutputTokens: metadata.maxOutputTokens ?? fallback.maxOutputTokens
+        )
+    }
+
+    /// Non-streaming requests stay idle until the reply is complete, and the
+    /// HTTP client retries a timed-out POST once, so the timeout has to cover
+    /// the thinking time of the effort level in use.
+    nonisolated static func requestTimeout(forEffort effort: String?) -> TimeInterval {
+        switch effort {
+        case "high": 120
+        case "xhigh": 180
+        case "max": 300
+        default: 60
+        }
+    }
+
+    nonisolated static func effortDisplayName(_ id: String) -> String {
+        switch id {
+        case "low": String(localized: "Low", bundle: localizationBundle)
+        case "medium": String(localized: "Medium", bundle: localizationBundle)
+        case "high": String(localized: "High", bundle: localizationBundle)
+        case "xhigh": String(localized: "X High", bundle: localizationBundle)
+        case "max": String(localized: "Maximum", bundle: localizationBundle)
+        default: id.capitalized
+        }
+    }
+
+    nonisolated private static var localizationBundle: Bundle {
+#if SWIFT_PACKAGE
+        .module
+#else
+        Bundle(for: ClaudePlugin.self)
+#endif
+    }
+
+    /// Resolves what a request sends: an effort the model doesn't take falls
+    /// back to the model default, adaptive thinking accompanies an effort where
+    /// the model needs it to think, and `temperature` is dropped whenever the
+    /// model can't take it.
+    nonisolated static func requestContext(
+        model: String,
+        requestedEffort: String?,
+        temperature: Double?,
+        metadata: ClaudeFetchedModel?
+    ) -> ClaudeRequestContext {
+        let capabilities = capabilities(for: model, metadata: metadata)
+        var effort = requestedEffort
+        if let requestedEffort, !capabilities.effortLevels.contains(requestedEffort) {
+            logger.info("Reasoning effort \(requestedEffort, privacy: .public) isn't available for \(model, privacy: .public); using the model default")
+            effort = nil
+        }
+        let adaptiveThinking = effort != nil && capabilities.supportsAdaptiveThinking
+        // Newer models reject sampling parameters outright; older ones while thinking.
+        let acceptsTemperature = !adaptiveThinking && !modelRejectsSamplingParams(model)
+        return ClaudeRequestContext(
+            model: model,
+            effort: effort,
+            adaptiveThinking: adaptiveThinking,
+            temperature: acceptsTemperature ? temperature : nil,
+            maxTokens: min(defaultMaxOutputTokens, capabilities.maxOutputTokens ?? defaultMaxOutputTokens),
+            timeout: requestTimeout(forEffort: effort ?? capabilities.defaultEffort)
+        )
+    }
+
     // MARK: - Anthropic Messages API
 
-    private func callMessagesAPI(
-        apiKey: String,
-        model: String,
+    nonisolated static func messagesRequestBody(
         systemPrompt: String,
         userText: String,
-        temperature: Double?
-    ) async throws -> String {
-        guard let url = URL(string: Self.messagesEndpoint) else {
-            throw PluginChatError.apiError("Invalid URL")
-        }
-
-        var requestBody: [String: Any] = [
-            "model": model,
-            "max_tokens": Self.maxOutputTokens,
+        context: ClaudeRequestContext
+    ) -> [String: Any] {
+        var body: [String: Any] = [
+            "model": context.model,
+            "max_tokens": context.maxTokens,
             "system": systemPrompt,
             "messages": [
                 ["role": "user", "content": userText]
             ]
         ]
-        // Only send the temperature override to models that accept it; newer
-        // families 400 on any sampling parameter.
-        if let temperature, !Self.modelRejectsSamplingParams(model) {
-            requestBody["temperature"] = temperature
+        if let effort = context.effort {
+            body["output_config"] = ["effort": effort]
+            if context.adaptiveThinking {
+                body["thinking"] = ["type": "adaptive"]
+            }
         }
+        if let temperature = context.temperature {
+            body["temperature"] = temperature
+        }
+        return body
+    }
 
-        let context = ClaudeRequestContext(
-            model: model,
-            maxTokens: Self.maxOutputTokens,
-            timeout: Self.messagesTimeout
-        )
+    private func callMessagesAPI(
+        apiKey: String,
+        systemPrompt: String,
+        userText: String,
+        context: ClaudeRequestContext
+    ) async throws -> String {
+        guard let url = URL(string: Self.messagesEndpoint) else {
+            throw PluginChatError.apiError("Invalid URL")
+        }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -644,7 +891,10 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
         request.setValue(Self.anthropicVersion, forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = context.timeout
-        request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
+        request.httpBody = try JSONSerialization.data(
+            withJSONObject: Self.messagesRequestBody(systemPrompt: systemPrompt, userText: userText, context: context)
+        )
+        let model = context.model
 
         let started = ContinuousClock.now
         let data: Data
@@ -731,7 +981,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
             // A reply stopped at max_tokens is incomplete; fail instead of returning it.
             if text.isEmpty {
                 throw PluginChatError.apiError(
-                    "Claude used the whole \(context.maxTokens)-token output limit before writing an answer, so there is no reply. Shorten the text and try again. \(details)"
+                    "Claude used the whole \(context.maxTokens)-token output limit before writing an answer, so there is no reply. Lower the reasoning effort or shorten the text. \(details)"
                 )
             }
             throw PluginChatError.apiError(
@@ -782,7 +1032,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
         switch statusCode {
         case 400:
             headline = "Claude rejected the request"
-            advice = "Check the selected model and its options in the Claude plugin settings."
+            advice = "Check the selected model, reasoning effort and temperature in the Claude plugin settings."
         case 401:
             headline = "Anthropic rejected the API key"
             advice = "Check or replace the key in Settings › Integrations › Claude."
@@ -814,7 +1064,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
             advice = "Try again; if it keeps happening, check status.anthropic.com."
         case 504:
             headline = "Anthropic timed out while processing the request"
-            advice = "Try again with a shorter text."
+            advice = "Try again with a shorter text or a lower reasoning effort."
         case 529:
             headline = "Anthropic's API is overloaded right now"
             advice = "Try again in a moment or switch to another model."
@@ -888,7 +1138,11 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
         let message: String
         switch error.code {
         case .timedOut:
-            message = "Anthropic didn't answer within \(Int(timeout)) s. Try again; long texts take longer."
+            if let effort = context?.effort {
+                message = "Anthropic didn't answer within \(Int(timeout)) s at reasoning effort \(effort). Higher efforts take longer; choose a lower one or try again."
+            } else {
+                message = "Anthropic didn't answer within \(Int(timeout)) s. Try again; long texts take longer."
+            }
         case .notConnectedToInternet:
             message = "This Mac is offline, so Anthropic couldn't be reached. Check the network connection and try again."
         case .networkConnectionLost:
@@ -943,15 +1197,36 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
     }
 }
 
-/// What a Messages request was sent with, for error messages and logs.
+/// What a Messages request is sent with; error messages and logs quote it.
 struct ClaudeRequestContext: Sendable {
     let model: String
+    /// `output_config.effort`, or nil for the model's default.
+    let effort: String?
+    /// Send `thinking: {type: "adaptive"}` (only together with an effort).
+    let adaptiveThinking: Bool
+    let temperature: Double?
     let maxTokens: Int
     let timeout: TimeInterval
 
     var detailItems: [String] {
-        ["model \(model)"]
+        var items = ["model \(model)"]
+        if let effort {
+            items.append("effort \(effort)")
+        }
+        return items
     }
+}
+
+/// What a model accepts for reasoning: from the Models API when cached,
+/// otherwise from `ClaudePlugin.staticCapabilities(for:)`.
+struct ClaudeModelCapabilities: Equatable, Sendable {
+    /// Supported `output_config.effort` values, lowest first.
+    let effortLevels: [String]
+    /// Whether `thinking: {type: "adaptive"}` is accepted.
+    let supportsAdaptiveThinking: Bool
+    /// The level the API applies when `effort` is omitted.
+    let defaultEffort: String?
+    let maxOutputTokens: Int?
 }
 
 /// Why the model list could not be refreshed (or the key not verified).
@@ -1073,11 +1348,72 @@ private struct ClaudeAPIModel: Decodable {
     let id: String
     let displayName: String?
     let createdAt: String?
+    let maxTokens: Int?
+    let capabilities: ClaudeAPICapabilities?
 
     enum CodingKeys: String, CodingKey {
         case id
         case displayName = "display_name"
         case createdAt = "created_at"
+        case maxTokens = "max_tokens"
+        case capabilities
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        displayName = try container.decodeIfPresent(String.self, forKey: .displayName)
+        createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt)
+        // Capability data only refines reasoning settings; an unexpected shape
+        // must never fail the whole model list.
+        maxTokens = try? container.decodeIfPresent(Int.self, forKey: .maxTokens)
+        capabilities = try? container.decodeIfPresent(ClaudeAPICapabilities.self, forKey: .capabilities)
+    }
+}
+
+/// The parts of `capabilities` the plugin reads; every leaf is `{"supported": Bool}`.
+private struct ClaudeAPICapabilities: Decodable {
+    struct Support: Decodable {
+        let supported: Bool?
+    }
+
+    struct Thinking: Decodable {
+        struct Types: Decodable {
+            let adaptive: Support?
+        }
+
+        let types: Types?
+    }
+
+    struct Effort: Decodable {
+        let supported: Bool?
+        let low: Support?
+        let medium: Support?
+        let high: Support?
+        let xhigh: Support?
+        let max: Support?
+
+        /// Supported levels, lowest first; empty when effort isn't supported.
+        var supportedLevels: [String] {
+            guard supported != false else { return [] }
+            return [("low", low), ("medium", medium), ("high", high), ("xhigh", xhigh), ("max", max)]
+                .filter { $0.1?.supported == true }
+                .map(\.0)
+        }
+    }
+
+    let thinking: Thinking?
+    let effort: Effort?
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        thinking = try? container.decodeIfPresent(Thinking.self, forKey: .thinking)
+        effort = try? container.decodeIfPresent(Effort.self, forKey: .effort)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case thinking
+        case effort
     }
 }
 
@@ -1088,6 +1424,14 @@ struct ClaudeFetchedModel: Codable, Sendable, Equatable {
     let displayName: String
     /// Epoch seconds parsed from the API `created_at`; used for newest-first sort.
     let createdAt: Double
+    /// The Models API capability fields below are nil in caches written by
+    /// plugin 1.1, where the static capability table applies instead.
+    /// API `max_tokens`: the model's output limit.
+    var maxOutputTokens: Int? = nil
+    /// `capabilities.thinking.types.adaptive.supported`
+    var supportsAdaptiveThinking: Bool? = nil
+    /// Levels with `capabilities.effort.<level>.supported`, lowest first.
+    var effortLevels: [String]? = nil
 }
 
 struct ClaudeModelCache: Codable, Sendable {
@@ -1110,6 +1454,8 @@ private struct ClaudeSettingsView: View {
     @State private var isRefreshing = false
     @State private var lastUpdated: Date?
     @State private var refreshErrorMessage: String?
+    @State private var reasoningEffortId = ""
+    @State private var isAdvancedExpanded = false
     private let bundle = Bundle(for: ClaudePlugin.self)
 
     var body: some View {
@@ -1238,6 +1584,16 @@ private struct ClaudeSettingsView: View {
 
                 Divider()
 
+                DisclosureGroup(
+                    String(localized: "Advanced", bundle: bundle),
+                    isExpanded: $isAdvancedExpanded
+                ) {
+                    advancedSettings
+                        .padding(.top, 8)
+                }
+
+                Divider()
+
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Temperature", bundle: bundle)
                         .font(.headline)
@@ -1265,6 +1621,12 @@ private struct ClaudeSettingsView: View {
                             .onChange(of: llmTemperatureValue) {
                                 plugin.setLLMTemperatureValue(llmTemperatureValue)
                             }
+
+                        if plugin.ignoresCustomTemperature(for: selectedModelId, reasoningEffortId: reasoningEffortId) {
+                            Text("Custom temperature is ignored for this model or while a reasoning effort is set.", bundle: bundle)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
             }
@@ -1281,6 +1643,7 @@ private struct ClaudeSettingsView: View {
             selectedModel = plugin.selectedLLMModelId ?? plugin.supportedModels.first?.id ?? ""
             llmTemperatureMode = plugin.llmTemperatureMode
             llmTemperatureValue = plugin.llmTemperatureValue
+            reasoningEffortId = plugin.reasoningEffortId
             lastUpdated = plugin.cacheLastUpdated
             // Serve the cache immediately; refresh in the background if stale.
             if plugin.isAvailable,
@@ -1289,6 +1652,72 @@ private struct ClaudeSettingsView: View {
                 refresh()
             }
         }
+    }
+
+    private var selectedModelId: String? {
+        selectedModel.isEmpty ? nil : selectedModel
+    }
+
+    private var supportedEfforts: [PluginLLMEffortInfo] {
+        plugin.supportedEfforts(for: selectedModelId)
+    }
+
+    private var advancedSettings: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            reasoningEffortSettings
+        }
+    }
+
+    private var reasoningEffortSettings: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if supportedEfforts.isEmpty {
+                Text("Reasoning Effort", bundle: bundle)
+                Text("The selected model doesn't support reasoning effort.", bundle: bundle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                // A saved effort this model doesn't offer shows as the model
+                // default (which requests use) without discarding the choice.
+                Picker(
+                    String(localized: "Reasoning Effort", bundle: bundle),
+                    selection: Binding(
+                        get: { supportedEfforts.contains { $0.id == reasoningEffortId } ? reasoningEffortId : "" },
+                        set: { reasoningEffortId = $0 }
+                    )
+                ) {
+                    Text(modelDefaultEffortLabel).tag("")
+                    ForEach(supportedEfforts, id: \.id) { effort in
+                        Text(effort.displayName).tag(effort.id)
+                    }
+                }
+                .pickerStyle(.menu)
+                .onChange(of: reasoningEffortId) {
+                    plugin.setReasoningEffort(reasoningEffortId)
+                }
+
+                Text("Controls how much thinking time the model spends before answering.", bundle: bundle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Applies when a workflow leaves effort on Provider Default. Higher levels are slower and use more output tokens.", bundle: bundle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if !reasoningEffortId.isEmpty,
+                   !supportedEfforts.contains(where: { $0.id == reasoningEffortId }) {
+                    Text("\(ClaudePlugin.effortDisplayName(reasoningEffortId)) isn't available for this model, so requests use the model default.", bundle: bundle)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
+        }
+    }
+
+    private var modelDefaultEffortLabel: String {
+        guard let level = plugin.modelDefaultEffortId(for: selectedModelId) else {
+            return String(localized: "Model Default", bundle: bundle)
+        }
+        let levelName = ClaudePlugin.effortDisplayName(level)
+        return String(localized: "Model Default (\(levelName))", bundle: bundle)
     }
 
     private func saveApiKey() {
