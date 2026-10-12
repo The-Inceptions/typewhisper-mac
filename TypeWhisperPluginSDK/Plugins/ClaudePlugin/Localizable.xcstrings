@@ -352,6 +352,28 @@
           }
         }
       }
+    },
+    "Couldn't verify the API key": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "APIキーを確認できませんでした"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "API-Schlüssel konnte nicht überprüft werden"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无法验证 API 密钥"
+          }
+        }
+      }
     }
   },
   "version": "1.0"

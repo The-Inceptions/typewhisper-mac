@@ -649,6 +649,233 @@ final class ClaudePluginTests: XCTestCase {
         XCTAssertNil(futureBody["temperature"], "temperature must be omitted for unknown future models")
     }
 
+    // MARK: - Descriptive errors
+
+    func testNotFoundNamesModelErrorTypeAndRequestId() async throws {
+        let error = try await Self.processError(
+            outcomes: [
+                .success(
+                    Self.errorBody(type: "not_found_error", message: "model: claude-opus-9"),
+                    Self.httpResponse(url: Self.messagesURL, statusCode: 404, headers: ["request-id": "req_header"])
+                ),
+            ],
+            model: "claude-opus-9"
+        )
+        let message = Self.apiErrorMessage(error)
+        XCTAssertTrue(message.hasPrefix("Model claude-opus-9 isn't available to this API key: model: claude-opus-9."), message)
+        XCTAssertTrue(message.contains("Refresh the model list"), message)
+        XCTAssertTrue(message.contains("[HTTP 404 not_found_error · model claude-opus-9 · request req_header]"), message)
+    }
+
+    func testRequestIdFallsBackToErrorBody() async throws {
+        let error = try await Self.processError(outcomes: [
+            .success(
+                Self.errorBody(type: "invalid_request_error", message: "max_tokens: too large", requestId: "req_from_body"),
+                Self.httpResponse(url: Self.messagesURL, statusCode: 400)
+            ),
+        ])
+        let message = Self.apiErrorMessage(error)
+        XCTAssertTrue(message.hasPrefix("Claude rejected the request: max_tokens: too large."), message)
+        XCTAssertTrue(message.contains("request req_from_body"), message)
+    }
+
+    func testAuthenticationFailureExplainsWhereToFixTheKey() async throws {
+        let error = try await Self.processError(outcomes: [
+            .success(
+                Self.errorBody(type: "authentication_error", message: "invalid x-api-key"),
+                Self.httpResponse(url: Self.messagesURL, statusCode: 401)
+            ),
+        ])
+        let message = Self.apiErrorMessage(error)
+        XCTAssertTrue(message.hasPrefix("Anthropic rejected the API key: invalid x-api-key."), message)
+        XCTAssertTrue(message.contains("Settings › Integrations › Claude"), message)
+    }
+
+    func testRateLimitNamesRetryDelayAndExhaustedLimit() async throws {
+        let error = try await Self.processError(outcomes: [
+            .success(
+                Self.errorBody(type: "rate_limit_error", message: "Number of request tokens has exceeded your per-minute rate limit"),
+                Self.httpResponse(
+                    url: Self.messagesURL,
+                    statusCode: 429,
+                    headers: [
+                        // Longer than the client's retry budget, so it is not retried.
+                        "retry-after": "40",
+                        "anthropic-ratelimit-output-tokens-limit": "400000",
+                        "anthropic-ratelimit-output-tokens-remaining": "0",
+                        "anthropic-ratelimit-output-tokens-reset": "2026-10-12T10:00:00Z",
+                    ]
+                )
+            ),
+        ])
+        let message = Self.apiErrorMessage(error)
+        XCTAssertTrue(message.hasPrefix("Anthropic's rate limit was reached:"), message)
+        XCTAssertTrue(message.contains("Retry in 40 s."), message)
+        XCTAssertTrue(message.contains("Output-token limit (400000) used up; it is fully replenished at"), message)
+        XCTAssertTrue(message.contains("HTTP 429 rate_limit_error"), message)
+    }
+
+    func testSpendCapIsToldApartFromRateLimit() async throws {
+        let error = try await Self.processError(outcomes: [
+            .success(
+                Self.errorBody(
+                    type: "rate_limit_error",
+                    message: "You have reached your API usage limits.",
+                    errorCode: "enforced_spend_limit_reached"
+                ),
+                Self.httpResponse(url: Self.messagesURL, statusCode: 429)
+            ),
+        ])
+        let message = Self.apiErrorMessage(error)
+        XCTAssertTrue(message.hasPrefix("Your organization reached its monthly API spend cap: You have reached your API usage limits."), message)
+        XCTAssertFalse(message.contains("Retry in"), message)
+    }
+
+    func testOverloadedSuggestsRetrying() async throws {
+        let error = try await Self.processError(outcomes: [
+            .success(
+                Self.errorBody(type: "overloaded_error", message: "Overloaded"),
+                Self.httpResponse(url: Self.messagesURL, statusCode: 529)
+            ),
+        ])
+        let message = Self.apiErrorMessage(error)
+        XCTAssertTrue(message.hasPrefix("Anthropic's API is overloaded right now: Overloaded."), message)
+        XCTAssertTrue(message.contains("HTTP 529 overloaded_error"), message)
+    }
+
+    func testHTMLErrorPageIsSummarized() async throws {
+        let html = "<html><head><title>502 Bad Gateway</title></head><body>cloudflare</body></html>"
+        let error = try await Self.processError(outcomes: [
+            .success(
+                Data(html.utf8),
+                Self.httpResponse(url: Self.messagesURL, statusCode: 502, headers: ["Content-Type": "text/html"])
+            ),
+        ])
+        let message = Self.apiErrorMessage(error)
+        XCTAssertTrue(message.hasPrefix("Anthropic returned HTTP 502: upstream returned an HTML error page"), message)
+        XCTAssertTrue(message.contains("502 Bad Gateway"), message)
+    }
+
+    func testEmptyJSONErrorBodyIsExplained() async throws {
+        let error = try await Self.processError(outcomes: [
+            .success(Data("{}".utf8), Self.httpResponse(url: Self.messagesURL, statusCode: 500)),
+        ])
+        let message = Self.apiErrorMessage(error)
+        XCTAssertTrue(message.hasPrefix("Anthropic had an internal error: the response carried no error details."), message)
+    }
+
+    func testRefusalIsReportedWithCategoryInsteadOfPartialText() async throws {
+        let body = #"""
+        {"content":[{"type":"text","text":"Partial"}],"stop_reason":"refusal",
+         "stop_details":{"type":"refusal","category":"cyber","explanation":"This request may enable harm"}}
+        """#
+        let error = try await Self.processError(outcomes: [
+            .success(Data(body.utf8), Self.httpResponse(url: Self.messagesURL, statusCode: 200)),
+        ])
+        let message = Self.apiErrorMessage(error)
+        XCTAssertTrue(message.hasPrefix("Claude declined this request (cyber): This request may enable harm."), message)
+        XCTAssertFalse(message.contains("Partial"), message)
+    }
+
+    func testMaxTokensWithoutTextExplainsTheMissingAnswer() async throws {
+        let body = #"{"content":[{"type":"thinking","thinking":"","signature":"sig"}],"stop_reason":"max_tokens"}"#
+        let error = try await Self.processError(outcomes: [
+            .success(Data(body.utf8), Self.httpResponse(url: Self.messagesURL, statusCode: 200)),
+        ])
+        let message = Self.apiErrorMessage(error)
+        XCTAssertTrue(message.contains("output limit before writing an answer"), message)
+    }
+
+    func testContextWindowStopIsExplained() async throws {
+        let body = #"{"content":[{"type":"text","text":"Part"}],"stop_reason":"model_context_window_exceeded"}"#
+        let error = try await Self.processError(outcomes: [
+            .success(Data(body.utf8), Self.httpResponse(url: Self.messagesURL, statusCode: 200)),
+        ])
+        let message = Self.apiErrorMessage(error)
+        XCTAssertTrue(message.hasPrefix("The text is too long for claude-sonnet-4-6's context window."), message)
+    }
+
+    func testReplyWithoutTextNamesStopReasonAndBlocks() async throws {
+        let body = #"{"content":[{"type":"thinking","thinking":"","signature":"sig"}],"stop_reason":"end_turn"}"#
+        let error = try await Self.processError(outcomes: [
+            .success(Data(body.utf8), Self.httpResponse(url: Self.messagesURL, statusCode: 200)),
+        ])
+        let message = Self.apiErrorMessage(error)
+        XCTAssertTrue(message.contains("stop reason: end_turn; content blocks: thinking"), message)
+    }
+
+    func testTimeoutBecomesNetworkErrorWithTheTimeout() async throws {
+        let error = try await Self.processError(outcomes: [.failure(URLError(.timedOut))])
+        guard case .networkError(let message)? = error as? PluginChatError else {
+            return XCTFail("Expected PluginChatError.networkError, got \(error)")
+        }
+        XCTAssertTrue(message.hasPrefix("Anthropic didn't answer within 60 s."), message)
+        XCTAssertTrue(message.contains("URLError \(URLError.Code.timedOut.rawValue)"), message)
+    }
+
+    func testCancellationIsRethrownUntouched() async throws {
+        let error = try await Self.processError(outcomes: [.failure(URLError(.cancelled))])
+        XCTAssertEqual((error as? URLError)?.code, .cancelled)
+    }
+
+    func testValidationFailureReasonTellsBadKeyFromOutage() async throws {
+        let host = try PluginTestHostServices()
+        let plugin = ClaudePlugin()
+        plugin.activate(host: host)
+
+        plugin.setApiKey("bad-key")
+        let rejectingStore = PluginHTTPClientSessionStore()
+        PluginHTTPClientTestHarness.configure { _ in
+            rejectingStore.makeSession(outcomes: [
+                .success(
+                    Self.errorBody(type: "authentication_error", message: "invalid x-api-key"),
+                    Self.httpResponse(url: Self.modelsURL, statusCode: 401)
+                ),
+            ])
+        }
+        let rejected = await plugin.validateApiKey("bad-key")
+        XCTAssertFalse(rejected)
+        let authFailure = try XCTUnwrap(plugin.lastModelRefreshFailure)
+        XCTAssertTrue(authFailure.isAuthenticationFailure)
+        XCTAssertTrue(authFailure.message.hasPrefix("Anthropic rejected the API key: invalid x-api-key."), authFailure.message)
+
+        plugin.setApiKey("good-key")
+        XCTAssertNil(plugin.lastModelRefreshFailure, "a new key must clear the previous key's failure")
+        let outageStore = PluginHTTPClientSessionStore()
+        PluginHTTPClientTestHarness.configure { _ in
+            outageStore.makeSession(outcomes: [
+                .success(
+                    Self.errorBody(type: "api_error", message: "Internal server error"),
+                    Self.httpResponse(url: Self.modelsURL, statusCode: 500)
+                ),
+            ])
+        }
+        let outage = await plugin.validateApiKey("good-key")
+        XCTAssertFalse(outage)
+        let outageFailure = try XCTUnwrap(plugin.lastModelRefreshFailure)
+        XCTAssertFalse(outageFailure.isAuthenticationFailure)
+        XCTAssertEqual(outageFailure.statusCode, 500)
+        XCTAssertTrue(outageFailure.message.hasPrefix("Anthropic had an internal error: Internal server error."), outageFailure.message)
+    }
+
+    func testOfflineRefreshRecordsNetworkReason() async throws {
+        let host = try PluginTestHostServices()
+        let plugin = ClaudePlugin()
+        plugin.activate(host: host)
+        plugin.setApiKey("claude-key")
+
+        let store = PluginHTTPClientSessionStore()
+        PluginHTTPClientTestHarness.configure { _ in
+            store.makeSession(outcomes: [.failure(URLError(.notConnectedToInternet))])
+        }
+
+        let refreshed = await plugin.refreshModels()
+        XCTAssertFalse(refreshed)
+        let failure = try XCTUnwrap(plugin.lastModelRefreshFailure)
+        XCTAssertNil(failure.statusCode)
+        XCTAssertTrue(failure.message.hasPrefix("This Mac is offline"), failure.message)
+    }
+
     // MARK: - Helpers
 
     private static func waitForRefreshWaiterCount(_ expectedCount: Int, plugin: ClaudePlugin) async {
@@ -698,14 +925,62 @@ final class ClaudePluginTests: XCTestCase {
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
-    private static func httpResponse(url: String, statusCode: Int) -> HTTPURLResponse {
+    private static func httpResponse(
+        url: String,
+        statusCode: Int,
+        headers: [String: String]? = nil
+    ) -> HTTPURLResponse {
         HTTPURLResponse(
             url: URL(string: url)!,
             statusCode: statusCode,
             httpVersion: nil,
-            headerFields: nil
+            headerFields: headers
         )!
     }
+
+    private static func errorBody(type: String, message: String, errorCode: String? = nil, requestId: String = "req_body") -> Data {
+        var error: [String: Any] = ["type": type, "message": message]
+        if let errorCode {
+            error["details"] = ["error_code": errorCode]
+        }
+        let body: [String: Any] = ["type": "error", "error": error, "request_id": requestId]
+        return try! JSONSerialization.data(withJSONObject: body)
+    }
+
+    /// Runs one Messages request against `outcomes` and returns the thrown error.
+    private static func processError(
+        outcomes: [PluginHTTPClientTestOutcome],
+        model: String = "claude-sonnet-4-6"
+    ) async throws -> Error {
+        let host = try PluginTestHostServices()
+        let plugin = ClaudePlugin()
+        plugin.activate(host: host) // no key on host → no background model refresh
+        plugin.setApiKey("claude-key")
+        let store = PluginHTTPClientSessionStore()
+        PluginHTTPClientTestHarness.configure { _ in
+            store.makeSession(outcomes: outcomes)
+        }
+        do {
+            let reply = try await plugin.process(systemPrompt: "sys", userText: "hi", model: model)
+            throw ClaudeTestExpectationError(description: "expected an error, got reply \(reply)")
+        } catch let error as ClaudeTestExpectationError {
+            throw error
+        } catch {
+            return error
+        }
+    }
+
+    private static func apiErrorMessage(_ error: Error, file: StaticString = #filePath, line: UInt = #line) -> String {
+        guard case .apiError(let message)? = error as? PluginChatError else {
+            XCTFail("Expected PluginChatError.apiError, got \(error)", file: file, line: line)
+            return ""
+        }
+        return message
+    }
+}
+
+private struct ClaudeTestExpectationError: Error, CustomStringConvertible {
+    let description: String
 }
 
 private actor ControlledClaudeModelFetcher {

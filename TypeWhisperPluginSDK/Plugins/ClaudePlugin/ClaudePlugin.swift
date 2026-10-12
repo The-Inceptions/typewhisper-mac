@@ -28,6 +28,11 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
     private static let cacheTTL: TimeInterval = 24 * 60 * 60
     /// Safety bound on pagination so a misbehaving `has_more` never loops forever.
     private static let maxModelPages = 20
+    /// Output budget for a reply; `stop_reason: max_tokens` turns into an error.
+    private static let maxOutputTokens = 4096
+    /// Non-streaming requests stay idle until the whole reply is ready.
+    private static let messagesTimeout: TimeInterval = 60
+    private static let logger = Logger(subsystem: "com.typewhisper.claude", category: "Plugin")
 
     typealias ModelFetchOperation = @Sendable (String) async -> [ClaudeFetchedModel]?
 
@@ -49,6 +54,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
         var modelCache: ClaudeModelCache?
         var refreshGeneration: UInt64 = 0
         var inFlightModelRefresh: InFlightModelRefresh?
+        var lastModelRefreshFailure: ClaudeModelRefreshFailure?
     }
 
     private struct ProcessingSnapshot {
@@ -255,6 +261,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
             if keyChanged {
                 state.refreshGeneration &+= 1
                 state.inFlightModelRefresh = nil
+                state.lastModelRefreshFailure = nil
             }
             return (state.host, task)
         }
@@ -276,6 +283,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
             state.apiKey = nil
             state.refreshGeneration &+= 1
             state.inFlightModelRefresh = nil
+            state.lastModelRefreshFailure = nil
             return (state.host, task)
         }
         transition.task?.cancel()
@@ -323,6 +331,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
                   state.apiKey == apiKey,
                   state.refreshGeneration == generation else { return nil }
             state.modelCache = cache
+            state.lastModelRefreshFailure = nil
             return state.host
         }
         guard let host else { return false }
@@ -334,8 +343,15 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
         return true
     }
 
+    /// Why the last model refresh (or key validation) failed, for the settings UI.
+    /// Cleared by a successful refresh and whenever the API key changes.
+    var lastModelRefreshFailure: ClaudeModelRefreshFailure? {
+        state.withLock { $0.lastModelRefreshFailure }
+    }
+
     /// Fetches the full model list (following pagination), returning nil on any
-    /// network/HTTP failure so callers can keep serving the existing cache.
+    /// network/HTTP failure so callers can keep serving the existing cache. The
+    /// reason is kept in `lastModelRefreshFailure`.
     func fetchModels(apiKey: String) async -> [ClaudeFetchedModel]? {
         guard !apiKey.isEmpty else { return nil }
 
@@ -357,28 +373,102 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
             request.setValue(Self.anthropicVersion, forHTTPHeaderField: "anthropic-version")
             request.timeoutInterval = 15
 
+            let data: Data
+            let response: URLResponse
             do {
-                let (data, response) = try await PluginHTTPClient.data(for: request)
-                guard let httpResponse = response as? HTTPURLResponse,
-                      httpResponse.statusCode == 200 else { return nil }
-                let page = try Self.decodeModelsPage(from: data)
-                collected.append(contentsOf: page.models)
-                guard page.hasMore else {
-                    return Self.sortedNewestFirst(collected)
-                }
-
-                guard let lastId = page.lastId?.trimmingCharacters(in: .whitespacesAndNewlines),
-                      !lastId.isEmpty,
-                      seenCursors.insert(lastId).inserted else { return nil }
-                afterId = lastId
+                (data, response) = try await PluginHTTPClient.data(for: request)
             } catch {
+                if let urlError = error as? URLError, urlError.code != .cancelled, !Task.isCancelled {
+                    recordModelRefreshFailure(
+                        ClaudeModelRefreshFailure(
+                            statusCode: nil,
+                            message: Self.transportFailureMessage(
+                                urlError,
+                                timeout: request.timeoutInterval,
+                                context: nil
+                            )
+                        ),
+                        apiKey: apiKey
+                    )
+                }
                 return nil
             }
+
+            guard let httpResponse = response as? HTTPURLResponse else {
+                recordModelRefreshFailure(
+                    ClaudeModelRefreshFailure(statusCode: nil, message: "Anthropic sent a response that isn't HTTP."),
+                    apiKey: apiKey
+                )
+                return nil
+            }
+            guard httpResponse.statusCode == 200 else {
+                recordModelRefreshFailure(
+                    ClaudeModelRefreshFailure(
+                        statusCode: httpResponse.statusCode,
+                        message: Self.describeHTTPFailure(
+                            statusCode: httpResponse.statusCode,
+                            data: data,
+                            response: httpResponse,
+                            context: nil
+                        )
+                    ),
+                    apiKey: apiKey
+                )
+                return nil
+            }
+
+            let page: (models: [ClaudeFetchedModel], hasMore: Bool, lastId: String?)
+            do {
+                page = try Self.decodeModelsPage(from: data)
+            } catch {
+                let summary = PluginHTTPErrorBodyFormatter.summary(from: data, response: httpResponse)
+                recordModelRefreshFailure(
+                    ClaudeModelRefreshFailure(
+                        statusCode: 200,
+                        message: "Couldn't read Anthropic's model list (\(data.count) bytes): \(summary)"
+                    ),
+                    apiKey: apiKey
+                )
+                return nil
+            }
+            collected.append(contentsOf: page.models)
+            guard page.hasMore else {
+                return Self.sortedNewestFirst(collected)
+            }
+
+            guard let lastId = page.lastId?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !lastId.isEmpty,
+                  seenCursors.insert(lastId).inserted else {
+                recordModelRefreshFailure(
+                    ClaudeModelRefreshFailure(
+                        statusCode: 200,
+                        message: "Anthropic's model list was incomplete (a page had no new cursor), so the cached list was kept."
+                    ),
+                    apiKey: apiKey
+                )
+                return nil
+            }
+            afterId = lastId
         }
 
         // Reaching the safety bound with `has_more` still set means the response
         // is incomplete. Never replace a known-good cache with a partial list.
+        recordModelRefreshFailure(
+            ClaudeModelRefreshFailure(
+                statusCode: 200,
+                message: "Anthropic's model list didn't end after \(Self.maxModelPages) pages, so the cached list was kept."
+            ),
+            apiKey: apiKey
+        )
         return nil
+    }
+
+    private func recordModelRefreshFailure(_ failure: ClaudeModelRefreshFailure, apiKey: String) {
+        Self.logger.error("Model list refresh failed: \(failure.message, privacy: .public)")
+        state.withLock { state in
+            guard state.apiKey == apiKey else { return }
+            state.lastModelRefreshFailure = failure
+        }
     }
 
     /// Explicit refresh used by the settings UI and the "Refresh models" button.
@@ -429,6 +519,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
 
             let id = UUID()
             let generation = state.refreshGeneration
+            state.lastModelRefreshFailure = nil
             let task = Task { [weak self] in
                 guard let self, !Task.isCancelled,
                       let models = await self.performModelFetch(apiKey: apiKey),
@@ -529,7 +620,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
 
         var requestBody: [String: Any] = [
             "model": model,
-            "max_tokens": 4096,
+            "max_tokens": Self.maxOutputTokens,
             "system": systemPrompt,
             "messages": [
                 ["role": "user", "content": userText]
@@ -541,51 +632,359 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
             requestBody["temperature"] = temperature
         }
 
+        let context = ClaudeRequestContext(
+            model: model,
+            maxTokens: Self.maxOutputTokens,
+            timeout: Self.messagesTimeout
+        )
+
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
         request.setValue(Self.anthropicVersion, forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 60
+        request.timeoutInterval = context.timeout
         request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
 
-        let (data, response) = try await PluginHTTPClient.data(for: request)
+        let started = ContinuousClock.now
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await PluginHTTPClient.data(for: request)
+        } catch {
+            // Cancellation is the caller's decision; pass it through untouched.
+            guard let urlError = error as? URLError, urlError.code != .cancelled, !Task.isCancelled else {
+                throw error
+            }
+            let message = Self.transportFailureMessage(urlError, timeout: context.timeout, context: context)
+            Self.logger.error("Messages request failed: \(message, privacy: .public)")
+            throw PluginChatError.networkError(message)
+        }
+        let elapsed = ContinuousClock.now - started
 
         guard let httpResponse = response as? HTTPURLResponse else {
-            throw PluginChatError.networkError("Invalid response")
+            throw PluginChatError.networkError(
+                "Anthropic sent a response that isn't HTTP. \(Self.detailSuffix(context: context))"
+            )
         }
+        let requestId = httpResponse.value(forHTTPHeaderField: "request-id")
 
-        switch httpResponse.statusCode {
-        case 200:
-            break
-        case 401:
-            throw PluginChatError.invalidApiKey
-        case 429:
-            throw PluginChatError.rateLimited
-        default:
-            var displayMessage = "HTTP \(httpResponse.statusCode)"
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let error = json["error"] as? [String: Any],
-               let message = error["message"] as? String {
-                displayMessage = message
-            }
-            throw PluginChatError.apiError(displayMessage)
+        guard httpResponse.statusCode == 200 else {
+            let message = Self.describeHTTPFailure(
+                statusCode: httpResponse.statusCode,
+                data: data,
+                response: httpResponse,
+                context: context
+            )
+            Self.logger.error("Messages request failed after \(String(describing: elapsed), privacy: .public): \(message, privacy: .public)")
+            throw PluginChatError.apiError(message)
         }
 
         guard let decoded = try? JSONDecoder().decode(ClaudeMessagesResponse.self, from: data) else {
-            throw PluginChatError.apiError("Failed to parse response")
+            let summary = PluginHTTPErrorBodyFormatter.summary(from: data, response: httpResponse)
+            let message = "Couldn't read Claude's reply (\(data.count) bytes): \(summary) "
+                + Self.detailSuffix(statusCode: 200, context: context, requestId: requestId)
+            Self.logger.error("\(message, privacy: .public)")
+            throw PluginChatError.apiError(message)
         }
 
-        // A reply stopped at max_tokens is incomplete; fail instead of returning it.
-        if decoded.stopReason == "max_tokens" {
-            throw PluginChatError.apiError("The reply was cut off at the output token limit (4096 tokens), so the text is incomplete.")
+        let usage = decoded.usage
+        Self.logger.info(
+            """
+            Messages \(decoded.model ?? model, privacy: .public) -> 200 in \(String(describing: elapsed), privacy: .public) \
+            [request \(requestId ?? "-", privacy: .public), stop \(decoded.stopReason ?? "-", privacy: .public), \
+            input \(usage?.inputTokens ?? 0), cache read \(usage?.cacheReadInputTokens ?? 0), \
+            cache write \(usage?.cacheCreationInputTokens ?? 0), output \(usage?.outputTokens ?? 0)]
+            """
+        )
+
+        do {
+            return try Self.replyText(from: decoded, context: context, requestId: requestId)
+        } catch {
+            Self.logger.error("Messages reply rejected: \(error.localizedDescription, privacy: .public)")
+            throw error
+        }
+    }
+
+    // MARK: - Reply and Error Descriptions
+
+    /// The reply text, or a descriptive error when the stop reason or content
+    /// means the text must not be inserted.
+    nonisolated static func replyText(
+        from response: ClaudeMessagesResponse,
+        context: ClaudeRequestContext,
+        requestId: String?
+    ) throws -> String {
+        let text = response.replyText
+        let details = detailSuffix(statusCode: 200, context: context, requestId: requestId)
+
+        switch response.stopReason {
+        case "refusal":
+            // Never return partial text from a declined reply.
+            let category = response.stopDetails?.category.map { " (\($0))" } ?? ""
+            let explanation = response.stopDetails?.explanation.map(sentence)
+                ?? "Anthropic's safety checks stopped the reply."
+            throw PluginChatError.apiError(
+                "Claude declined this request\(category): \(explanation) Rephrase the text or try another model. \(details)"
+            )
+        case "max_tokens":
+            // A reply stopped at max_tokens is incomplete; fail instead of returning it.
+            if text.isEmpty {
+                throw PluginChatError.apiError(
+                    "Claude used the whole \(context.maxTokens)-token output limit before writing an answer, so there is no reply. Shorten the text and try again. \(details)"
+                )
+            }
+            throw PluginChatError.apiError(
+                "The reply was cut off at the output token limit (\(context.maxTokens) tokens), so the text is incomplete. \(details)"
+            )
+        case "model_context_window_exceeded":
+            throw PluginChatError.apiError(
+                "The text is too long for \(context.model)'s context window. Shorten it or choose a model with a larger context window. \(details)"
+            )
+        default:
+            break
         }
 
-        let text = decoded.replyText
         guard !text.isEmpty else {
-            throw PluginChatError.apiError("Failed to parse response")
+            let blockTypes = response.content.map(\.type)
+            let blocks = blockTypes.isEmpty ? "none" : blockTypes.joined(separator: ", ")
+            throw PluginChatError.apiError(
+                "Claude returned no text (stop reason: \(response.stopReason ?? "none"); content blocks: \(blocks)). Try again. \(details)"
+            )
         }
         return text
+    }
+
+    /// Describes a non-200 Anthropic response: what failed, Anthropic's own
+    /// message, what to do, then status, error type, request settings and the
+    /// request id (the host's error log shows only the first lines, so the
+    /// cause and the fix come first).
+    nonisolated static func describeHTTPFailure(
+        statusCode: Int,
+        data: Data,
+        response: HTTPURLResponse,
+        context: ClaudeRequestContext?
+    ) -> String {
+        let envelope = try? JSONDecoder().decode(ClaudeAPIErrorEnvelope.self, from: data)
+        let errorType = envelope?.error?.type
+        let providerMessage: String
+        if let message = envelope?.error?.message?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !message.isEmpty {
+            providerMessage = PluginHTTPErrorBodyFormatter.summary(from: message)
+        } else {
+            let body = PluginHTTPErrorBodyFormatter.summary(from: data, response: response)
+            providerMessage = body == "{}" || body == "[]" ? "the response carried no error details" : body
+        }
+        let requestId = response.value(forHTTPHeaderField: "request-id") ?? envelope?.requestId
+
+        let headline: String
+        var advice: String?
+        switch statusCode {
+        case 400:
+            headline = "Claude rejected the request"
+            advice = "Check the selected model and its options in the Claude plugin settings."
+        case 401:
+            headline = "Anthropic rejected the API key"
+            advice = "Check or replace the key in Settings › Integrations › Claude."
+        case 402:
+            headline = "Anthropic reported a billing problem"
+            advice = "Check Plans & Billing in the Claude Console."
+        case 403:
+            headline = context.map { "This API key isn't allowed to use \($0.model)" }
+                ?? "This API key isn't allowed to make this request"
+            advice = "Check the key's organization and workspace access in the Claude Console."
+        case 404:
+            if let context {
+                headline = "Model \(context.model) isn't available to this API key"
+                advice = "Refresh the model list in the Claude plugin settings and choose another model."
+            } else {
+                headline = "Anthropic couldn't find the requested resource"
+            }
+        case 413:
+            headline = "The request is larger than Anthropic accepts (32 MB)"
+            advice = "Shorten the text and try again."
+        case 429 where envelope?.error?.details?.errorCode == "enforced_spend_limit_reached":
+            headline = "Your organization reached its monthly API spend cap"
+            advice = "Raise the cap under Settings › Billing in the Claude Console, or wait until it resets."
+        case 429:
+            headline = "Anthropic's rate limit was reached"
+            advice = rateLimitAdvice(from: response)
+        case 500:
+            headline = "Anthropic had an internal error"
+            advice = "Try again; if it keeps happening, check status.anthropic.com."
+        case 504:
+            headline = "Anthropic timed out while processing the request"
+            advice = "Try again with a shorter text."
+        case 529:
+            headline = "Anthropic's API is overloaded right now"
+            advice = "Try again in a moment or switch to another model."
+        default:
+            headline = "Anthropic returned HTTP \(statusCode)"
+        }
+
+        var message = "\(headline): \(sentence(providerMessage))"
+        if let advice {
+            message += " \(advice)"
+        }
+        return message + " " + detailSuffix(
+            statusCode: statusCode,
+            errorType: errorType,
+            context: context,
+            requestId: requestId
+        )
+    }
+
+    /// The `retry-after` delay and, when one is used up, which rate limit and
+    /// when it is replenished.
+    nonisolated static func rateLimitAdvice(from response: HTTPURLResponse) -> String {
+        var advice: [String] = []
+        if let raw = response.value(forHTTPHeaderField: "retry-after")?.trimmingCharacters(in: .whitespaces),
+           let seconds = Int(raw), seconds >= 0 {
+            advice.append("Retry in \(seconds) s.")
+        }
+        let limits = [
+            ("requests", "Request"),
+            ("input-tokens", "Input-token"),
+            ("output-tokens", "Output-token"),
+            ("tokens", "Token"),
+        ]
+        for (header, label) in limits {
+            let prefix = "anthropic-ratelimit-\(header)"
+            guard response.value(forHTTPHeaderField: "\(prefix)-remaining")?
+                .trimmingCharacters(in: .whitespaces) == "0" else { continue }
+            var text = "\(label) limit"
+            if let limit = response.value(forHTTPHeaderField: "\(prefix)-limit") {
+                text += " (\(limit))"
+            }
+            text += " used up"
+            if let reset = response.value(forHTTPHeaderField: "\(prefix)-reset") {
+                text += "; it is fully replenished at \(formattedResetTime(reset))"
+            }
+            advice.append(text + ".")
+            break
+        }
+        if advice.isEmpty {
+            advice.append("Wait a moment and try again, or check your limits in the Claude Console.")
+        }
+        return advice.joined(separator: " ")
+    }
+
+    nonisolated private static func formattedResetTime(_ raw: String) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: raw) {
+            return date.formatted(date: .omitted, time: .standard)
+        }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: raw)?.formatted(date: .omitted, time: .standard) ?? raw
+    }
+
+    /// Describes a request that never got an HTTP response.
+    nonisolated static func transportFailureMessage(
+        _ error: URLError,
+        timeout: TimeInterval,
+        context: ClaudeRequestContext?
+    ) -> String {
+        let message: String
+        switch error.code {
+        case .timedOut:
+            message = "Anthropic didn't answer within \(Int(timeout)) s. Try again; long texts take longer."
+        case .notConnectedToInternet:
+            message = "This Mac is offline, so Anthropic couldn't be reached. Check the network connection and try again."
+        case .networkConnectionLost:
+            message = "The connection to Anthropic dropped before the reply arrived. Try again; an unstable network or VPN can cause this."
+        case .cannotFindHost, .dnsLookupFailed:
+            message = "api.anthropic.com couldn't be found. Check DNS, VPN or proxy settings."
+        case .cannotConnectToHost:
+            message = "Couldn't connect to api.anthropic.com. A firewall, proxy or VPN may be blocking it."
+        case .secureConnectionFailed,
+             .serverCertificateHasBadDate,
+             .serverCertificateUntrusted,
+             .serverCertificateHasUnknownRoot,
+             .serverCertificateNotYetValid,
+             .clientCertificateRejected,
+             .clientCertificateRequired:
+            message = "The secure connection to api.anthropic.com failed. A proxy, VPN or security tool may be intercepting HTTPS."
+        default:
+            message = "Couldn't reach Anthropic: \(sentence(error.localizedDescription))"
+        }
+        return message + " " + detailSuffix(
+            context: context,
+            extra: ["URLError \(error.code.rawValue)"]
+        )
+    }
+
+    /// "[HTTP 404 not_found_error · model claude-x · request req_…]"
+    nonisolated static func detailSuffix(
+        statusCode: Int? = nil,
+        errorType: String? = nil,
+        context: ClaudeRequestContext?,
+        requestId: String? = nil,
+        extra: [String] = []
+    ) -> String {
+        var items: [String] = []
+        if let statusCode {
+            items.append(["HTTP \(statusCode)", errorType].compactMap { $0 }.joined(separator: " "))
+        }
+        items.append(contentsOf: extra)
+        if let context {
+            items.append(contentsOf: context.detailItems)
+        }
+        if let requestId, !requestId.isEmpty {
+            items.append("request \(requestId)")
+        }
+        return items.isEmpty ? "" : "[\(items.joined(separator: " · "))]"
+    }
+
+    nonisolated private static func sentence(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let last = trimmed.last else { return trimmed }
+        return ".!?…".contains(last) ? trimmed : trimmed + "."
+    }
+}
+
+/// What a Messages request was sent with, for error messages and logs.
+struct ClaudeRequestContext: Sendable {
+    let model: String
+    let maxTokens: Int
+    let timeout: TimeInterval
+
+    var detailItems: [String] {
+        ["model \(model)"]
+    }
+}
+
+/// Why the model list could not be refreshed (or the key not verified).
+struct ClaudeModelRefreshFailure: Sendable, Equatable {
+    /// HTTP status, or nil when no HTTP response arrived.
+    let statusCode: Int?
+    let message: String
+
+    var isAuthenticationFailure: Bool { statusCode == 401 }
+}
+
+/// Anthropic's error body: `{"type":"error","error":{"type","message","details"},"request_id"}`.
+private struct ClaudeAPIErrorEnvelope: Decodable {
+    struct APIError: Decodable {
+        struct Details: Decodable {
+            let errorCode: String?
+
+            enum CodingKeys: String, CodingKey {
+                case errorCode = "error_code"
+            }
+        }
+
+        let type: String?
+        let message: String?
+        let details: Details?
+    }
+
+    let error: APIError?
+    let requestId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case error
+        case requestId = "request_id"
     }
 }
 
@@ -601,18 +1000,49 @@ struct ClaudeMessagesResponse: Decodable {
         let text: String?
     }
 
+    /// Populated when `stop_reason` is `refusal`.
+    struct StopDetails: Decodable {
+        let category: String?
+        let explanation: String?
+    }
+
+    struct Usage: Decodable {
+        let inputTokens: Int?
+        let outputTokens: Int?
+        let cacheCreationInputTokens: Int?
+        let cacheReadInputTokens: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case inputTokens = "input_tokens"
+            case outputTokens = "output_tokens"
+            case cacheCreationInputTokens = "cache_creation_input_tokens"
+            case cacheReadInputTokens = "cache_read_input_tokens"
+        }
+    }
+
+    /// The model that produced the reply.
+    let model: String?
     let content: [ContentBlock]
     let stopReason: String?
+    let stopDetails: StopDetails?
+    let usage: Usage?
 
     enum CodingKeys: String, CodingKey {
+        case model
         case content
         case stopReason = "stop_reason"
+        case stopDetails = "stop_details"
+        case usage
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        model = try container.decodeIfPresent(String.self, forKey: .model)
         content = try container.decodeIfPresent([ContentBlock].self, forKey: .content) ?? []
         stopReason = try container.decodeIfPresent(String.self, forKey: .stopReason)
+        // Optional extras must never turn a usable reply into a parse failure.
+        stopDetails = try? container.decodeIfPresent(StopDetails.self, forKey: .stopDetails)
+        usage = try? container.decodeIfPresent(Usage.self, forKey: .usage)
     }
 
     /// The joined text blocks; `thinking` and `redacted_thinking` blocks are skipped.
@@ -672,6 +1102,7 @@ private struct ClaudeSettingsView: View {
     @State private var apiKeyInput = ""
     @State private var isValidating = false
     @State private var validationResult: Bool?
+    @State private var validationFailure: ClaudeModelRefreshFailure?
     @State private var showApiKey = false
     @State private var selectedModel: String = ""
     @State private var llmTemperatureMode: PluginLLMTemperatureMode = .providerDefault
@@ -709,6 +1140,7 @@ private struct ClaudeSettingsView: View {
                         Button(String(localized: "Remove", bundle: bundle)) {
                             apiKeyInput = ""
                             validationResult = nil
+                            validationFailure = nil
                             refreshErrorMessage = nil
                             plugin.removeApiKey()
                         }
@@ -736,9 +1168,16 @@ private struct ClaudeSettingsView: View {
                     HStack(spacing: 4) {
                         Image(systemName: result ? "checkmark.circle.fill" : "xmark.circle.fill")
                             .foregroundStyle(result ? .green : .red)
-                        Text(result ? String(localized: "Valid API Key", bundle: bundle) : String(localized: "Invalid API Key", bundle: bundle))
+                        Text(validationLabel(isValid: result))
                             .font(.caption)
                             .foregroundStyle(result ? .green : .red)
+                    }
+                    if !result, let validationFailure {
+                        Text(validationFailure.message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
@@ -792,6 +1231,8 @@ private struct ClaudeSettingsView: View {
                         Label(refreshErrorMessage, systemImage: "exclamationmark.triangle.fill")
                             .font(.caption)
                             .foregroundStyle(.red)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
 
@@ -858,18 +1299,32 @@ private struct ClaudeSettingsView: View {
 
         isValidating = true
         validationResult = nil
+        validationFailure = nil
         refreshErrorMessage = nil
         Task {
             let isValid = await plugin.validateApiKey(trimmedKey)
             await MainActor.run {
                 isValidating = false
                 validationResult = isValid
+                validationFailure = isValid ? nil : plugin.lastModelRefreshFailure
                 if isValid {
                     lastUpdated = plugin.cacheLastUpdated
                     selectedModel = plugin.selectedLLMModelId ?? plugin.supportedModels.first?.id ?? ""
                 }
             }
         }
+    }
+
+    /// Only a 401 proves the key is wrong; other failures (offline, outage)
+    /// mean the key could not be checked.
+    private func validationLabel(isValid: Bool) -> String {
+        if isValid {
+            return String(localized: "Valid API Key", bundle: bundle)
+        }
+        if let validationFailure, !validationFailure.isAuthenticationFailure {
+            return String(localized: "Couldn't verify the API key", bundle: bundle)
+        }
+        return String(localized: "Invalid API Key", bundle: bundle)
     }
 
     private func refresh() {
@@ -888,7 +1343,7 @@ private struct ClaudeSettingsView: View {
                         ?? plugin.supportedModels.first?.id
                         ?? selectedModel
                 } else {
-                    refreshErrorMessage = String(
+                    refreshErrorMessage = plugin.lastModelRefreshFailure?.message ?? String(
                         localized: "Unable to refresh models. Check your connection and try again.",
                         bundle: bundle
                     )
