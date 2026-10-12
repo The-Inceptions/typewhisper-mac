@@ -651,6 +651,24 @@ final class ClaudePluginTests: XCTestCase {
 
     // MARK: - Descriptive errors
 
+    func testMalformedSuccessResponseDoesNotExposeBodyInReportedError() async throws {
+        let privateText = "private-transcript-marker"
+        let data = Data("{\"content\":[{\"type\":\"text\",\"text\":\"\(privateText)\"}]".utf8)
+        let error = try await Self.processError(outcomes: [
+            .success(
+                data,
+                Self.httpResponse(url: Self.messagesURL, statusCode: 200, headers: ["request-id": "req_malformed"])
+            ),
+        ])
+
+        let message = Self.apiErrorMessage(error)
+        XCTAssertTrue(message.contains("Couldn't read Claude's reply (\(data.count) bytes)"), message)
+        XCTAssertTrue(message.contains("HTTP 200"), message)
+        XCTAssertTrue(message.contains("model claude-sonnet-4-6"), message)
+        XCTAssertTrue(message.contains("request req_malformed"), message)
+        XCTAssertFalse(error.localizedDescription.contains(privateText), "Reported errors can be persisted by the host")
+    }
+
     func testNotFoundNamesModelErrorTypeAndRequestId() async throws {
         let error = try await Self.processError(
             outcomes: [

@@ -1004,7 +1004,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
 
         guard let decoded = try? JSONDecoder().decode(ClaudeMessagesResponse.self, from: data) else {
             let summary = PluginHTTPErrorBodyFormatter.summary(from: data, response: httpResponse)
-            let message = "Couldn't read Claude's reply (\(data.count) bytes): \(summary) "
+            let message = "Couldn't read Claude's reply (\(data.count) bytes). "
                 + Self.detailSuffix(statusCode: 200, context: context, requestId: requestId)
             Self.logger.error(
                 "Couldn't read Claude's reply (\(data.count) bytes) \(Self.detailSuffix(statusCode: 200, context: context, requestId: requestId), privacy: .public): \(summary, privacy: .private)"
