@@ -572,19 +572,56 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureControllabl
             throw PluginChatError.apiError(displayMessage)
         }
 
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = json["content"] as? [[String: Any]],
-              let first = content.first,
-              let text = first["text"] as? String else {
+        guard let decoded = try? JSONDecoder().decode(ClaudeMessagesResponse.self, from: data) else {
             throw PluginChatError.apiError("Failed to parse response")
         }
 
         // A reply stopped at max_tokens is incomplete; fail instead of returning it.
-        if (json["stop_reason"] as? String) == "max_tokens" {
+        if decoded.stopReason == "max_tokens" {
             throw PluginChatError.apiError("The reply was cut off at the output token limit (4096 tokens), so the text is incomplete.")
         }
 
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = decoded.replyText
+        guard !text.isEmpty else {
+            throw PluginChatError.apiError("Failed to parse response")
+        }
+        return text
+    }
+}
+
+// MARK: - Messages API Decoding
+
+/// The parts of a Messages API response the plugin reads. Models that think
+/// (adaptive thinking is on by default from Claude Sonnet 5 / Opus 5 on) put
+/// `thinking` blocks ahead of the answer, so the reply is every `text` block,
+/// never just the first content block.
+struct ClaudeMessagesResponse: Decodable {
+    struct ContentBlock: Decodable {
+        let type: String
+        let text: String?
+    }
+
+    let content: [ContentBlock]
+    let stopReason: String?
+
+    enum CodingKeys: String, CodingKey {
+        case content
+        case stopReason = "stop_reason"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        content = try container.decodeIfPresent([ContentBlock].self, forKey: .content) ?? []
+        stopReason = try container.decodeIfPresent(String.self, forKey: .stopReason)
+    }
+
+    /// The joined text blocks; `thinking` and `redacted_thinking` blocks are skipped.
+    var replyText: String {
+        content
+            .filter { $0.type == "text" }
+            .compactMap(\.text)
+            .joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

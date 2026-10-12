@@ -429,6 +429,31 @@ final class ClaudePluginTests: XCTestCase {
         }
     }
 
+    func testProcessReturnsTextThatFollowsThinkingBlocks() async throws {
+        let host = try PluginTestHostServices()
+        let plugin = ClaudePlugin()
+        plugin.activate(host: host) // no key on host → no background model refresh
+        plugin.setApiKey("claude-key")
+
+        let body = #"""
+        {"content":[
+            {"type":"thinking","thinking":"","signature":"sig"},
+            {"type":"redacted_thinking","data":"opaque"},
+            {"type":"text","text":"Hello"},
+            {"type":"text","text":" world\n"}
+        ],"stop_reason":"end_turn"}
+        """#
+        let store = PluginHTTPClientSessionStore()
+        PluginHTTPClientTestHarness.configure { _ in
+            store.makeSession(outcomes: [
+                .success(Data(body.utf8), Self.httpResponse(url: Self.messagesURL, statusCode: 200)),
+            ])
+        }
+
+        let reply = try await plugin.process(systemPrompt: "sys", userText: "hi", model: "claude-sonnet-5")
+        XCTAssertEqual(reply, "Hello world", "thinking blocks before the answer must not hide the text blocks")
+    }
+
     func testSelectedModelIsPreservedWhenNotInList() throws {
         let host = try PluginTestHostServices(
             defaults: [Self.selectedLLMModelKey: "claude-haiku-4-5-20251001"]
