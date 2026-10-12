@@ -624,7 +624,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
     }
 
     private func recordModelRefreshFailure(_ failure: ClaudeModelRefreshFailure, apiKey: String) {
-        Self.logger.error("Model list refresh failed: \(failure.message, privacy: .public)")
+        Self.logger.error("Model list refresh failed: \(failure.message, privacy: .private)")
         state.withLock { state in
             guard state.apiKey == apiKey else { return }
             state.lastModelRefreshFailure = failure
@@ -979,7 +979,9 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
                 throw error
             }
             let message = Self.transportFailureMessage(urlError, timeout: context.timeout, context: context)
-            Self.logger.error("Messages request failed: \(message, privacy: .public)")
+            Self.logger.error(
+                "Messages request failed [URLError \(urlError.code.rawValue)] \(Self.detailSuffix(context: context), privacy: .public): \(message, privacy: .private)"
+            )
             throw PluginChatError.networkError(message)
         }
         let elapsed = ContinuousClock.now - started
@@ -998,7 +1000,9 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
                 response: httpResponse,
                 context: context
             )
-            Self.logger.error("Messages request failed after \(String(describing: elapsed), privacy: .public): \(message, privacy: .public)")
+            Self.logger.error(
+                "Messages request failed after \(String(describing: elapsed), privacy: .public) \(Self.detailSuffix(statusCode: httpResponse.statusCode, context: context, requestId: requestId), privacy: .public): \(message, privacy: .private)"
+            )
             throw PluginChatError.apiError(message)
         }
 
@@ -1039,7 +1043,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
         do {
             return try Self.replyText(from: decoded, context: context, requestId: requestId)
         } catch {
-            Self.logger.error("Messages reply rejected: \(error.localizedDescription, privacy: .public)")
+            Self.logger.error("Messages reply rejected")
             throw error
         }
     }
