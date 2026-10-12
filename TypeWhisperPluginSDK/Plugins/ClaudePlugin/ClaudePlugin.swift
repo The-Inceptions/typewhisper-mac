@@ -25,6 +25,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
     private static let selectedLLMModelKey = "selectedLLMModel"
     private static let cachedModelsKey = "fetchedLLMModels.v1"
     private static let reasoningEffortKey = "reasoningEffort"
+    private static let promptCacheKey = "promptCacheTTL"
     /// Serve a cached model list without re-fetching for 24 hours.
     private static let cacheTTL: TimeInterval = 24 * 60 * 60
     /// Safety bound on pagination so a misbehaving `has_more` never loops forever.
@@ -50,6 +51,8 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
         var llmTemperatureValue = 0.3
         /// Saved `output_config.effort`; empty means the model's own default.
         var reasoningEffortId = ""
+        var promptCache = ClaudePromptCache.fiveMinutes
+        var lastRequestSummary: ClaudeRequestSummary?
         var modelCache: ClaudeModelCache?
         var refreshGeneration: UInt64 = 0
         var inFlightModelRefresh: InFlightModelRefresh?
@@ -62,6 +65,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
         let defaultModelId: String
         let temperatureDirective: PluginLLMTemperatureDirective
         let reasoningEffortId: String
+        let promptCache: ClaudePromptCache
         let modelCache: ClaudeModelCache?
     }
 
@@ -95,6 +99,8 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
         let reasoningEffortId = Self.normalizedEffortId(
             host.userDefault(forKey: Self.reasoningEffortKey) as? String
         ) ?? ""
+        let promptCache = (host.userDefault(forKey: Self.promptCacheKey) as? String)
+            .flatMap(ClaudePromptCache.init(rawValue:)) ?? .fiveMinutes
 
         let previousTask = state.withLock { state -> Task<Bool, Never>? in
             let previousTask = state.inFlightModelRefresh?.task
@@ -105,6 +111,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
             state.llmTemperatureModeRaw = llmTemperatureModeRaw
             state.llmTemperatureValue = llmTemperatureValue
             state.reasoningEffortId = reasoningEffortId
+            state.promptCache = promptCache
             state.modelCache = modelCache
             state.refreshGeneration &+= 1
             state.inFlightModelRefresh = nil
@@ -235,6 +242,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
                     value: state.llmTemperatureValue
                 ),
                 reasoningEffortId: state.reasoningEffortId,
+                promptCache: state.promptCache,
                 modelCache: state.modelCache
             )
         }
@@ -247,6 +255,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
             model: modelId,
             requestedEffort: Self.normalizedEffortId(effort) ?? Self.normalizedEffortId(snapshot.reasoningEffortId),
             temperature: resolvedTemperature,
+            promptCache: snapshot.promptCache,
             metadata: snapshot.modelCache?.models.first { $0.id == modelId }
         )
         return try await callMessagesAPI(
@@ -305,6 +314,21 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
         } ?? false
         return thinks || Self.modelRejectsSamplingParams(resolved.id)
     }
+
+    // MARK: - Prompt Caching
+
+    var promptCache: ClaudePromptCache { state.withLock { $0.promptCache } }
+
+    func setPromptCache(_ promptCache: ClaudePromptCache) {
+        let host = state.withLock { state -> HostServices? in
+            state.promptCache = promptCache
+            return state.host
+        }
+        host?.setUserDefault(promptCache.rawValue, forKey: Self.promptCacheKey)
+    }
+
+    /// Token usage of the last answered request; shows whether caching works.
+    var lastRequestSummary: ClaudeRequestSummary? { state.withLock { $0.lastRequestSummary } }
 
     /// `model`, or the model a request without one would use, with its capabilities.
     private func resolvedModel(_ model: String?) -> (id: String, capabilities: ClaudeModelCapabilities) {
@@ -827,6 +851,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
         model: String,
         requestedEffort: String?,
         temperature: Double?,
+        promptCache: ClaudePromptCache = .off,
         metadata: ClaudeFetchedModel?
     ) -> ClaudeRequestContext {
         let capabilities = capabilities(for: model, metadata: metadata)
@@ -843,6 +868,7 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
             effort: effort,
             adaptiveThinking: adaptiveThinking,
             temperature: acceptsTemperature ? temperature : nil,
+            promptCache: promptCache,
             maxTokens: min(defaultMaxOutputTokens, capabilities.maxOutputTokens ?? defaultMaxOutputTokens),
             timeout: requestTimeout(forEffort: effort ?? capabilities.defaultEffort)
         )
@@ -863,6 +889,15 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
                 ["role": "user", "content": userText]
             ]
         ]
+        // The breakpoint closes the stable prefix (the workflow's system prompt);
+        // the dictated text after it differs every time and is never cached.
+        // Top-level automatic caching would place it after that text instead.
+        if let cacheControl = context.promptCache.cacheControl,
+           !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            body["system"] = [
+                ["type": "text", "text": systemPrompt, "cache_control": cacheControl]
+            ]
+        }
         if let effort = context.effort {
             body["output_config"] = ["effort": effort]
             if context.adaptiveThinking {
@@ -947,6 +982,15 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
             cache write \(usage?.cacheCreationInputTokens ?? 0), output \(usage?.outputTokens ?? 0)]
             """
         )
+        let summary = ClaudeRequestSummary(
+            date: Date(),
+            model: decoded.model ?? model,
+            inputTokens: usage?.inputTokens ?? 0,
+            cacheReadInputTokens: usage?.cacheReadInputTokens ?? 0,
+            cacheCreationInputTokens: usage?.cacheCreationInputTokens ?? 0,
+            outputTokens: usage?.outputTokens ?? 0
+        )
+        state.withLock { $0.lastRequestSummary = summary }
 
         do {
             return try Self.replyText(from: decoded, context: context, requestId: requestId)
@@ -1205,6 +1249,7 @@ struct ClaudeRequestContext: Sendable {
     /// Send `thinking: {type: "adaptive"}` (only together with an effort).
     let adaptiveThinking: Bool
     let temperature: Double?
+    let promptCache: ClaudePromptCache
     let maxTokens: Int
     let timeout: TimeInterval
 
@@ -1213,8 +1258,39 @@ struct ClaudeRequestContext: Sendable {
         if let effort {
             items.append("effort \(effort)")
         }
+        if promptCache != .off {
+            items.append("cache \(promptCache.rawValue)")
+        }
         return items
     }
+}
+
+/// `cache_control` on the system prompt. Prompts shorter than the model's
+/// minimum (512 to 4,096 tokens) are not cached and cost nothing extra.
+enum ClaudePromptCache: String, CaseIterable, Sendable {
+    case off
+    case fiveMinutes = "5m"
+    case oneHour = "1h"
+
+    /// The `cache_control` object, or nil when caching is off.
+    var cacheControl: [String: String]? {
+        switch self {
+        case .off: nil
+        case .fiveMinutes: ["type": "ephemeral"]
+        case .oneHour: ["type": "ephemeral", "ttl": "1h"]
+        }
+    }
+}
+
+/// Token usage of an answered request, shown in the settings view.
+struct ClaudeRequestSummary: Sendable, Equatable {
+    let date: Date
+    /// The model that answered.
+    let model: String
+    let inputTokens: Int
+    let cacheReadInputTokens: Int
+    let cacheCreationInputTokens: Int
+    let outputTokens: Int
 }
 
 /// What a model accepts for reasoning: from the Models API when cached,
@@ -1455,6 +1531,7 @@ private struct ClaudeSettingsView: View {
     @State private var lastUpdated: Date?
     @State private var refreshErrorMessage: String?
     @State private var reasoningEffortId = ""
+    @State private var promptCache: ClaudePromptCache = .fiveMinutes
     @State private var isAdvancedExpanded = false
     private let bundle = Bundle(for: ClaudePlugin.self)
 
@@ -1644,6 +1721,7 @@ private struct ClaudeSettingsView: View {
             llmTemperatureMode = plugin.llmTemperatureMode
             llmTemperatureValue = plugin.llmTemperatureValue
             reasoningEffortId = plugin.reasoningEffortId
+            promptCache = plugin.promptCache
             lastUpdated = plugin.cacheLastUpdated
             // Serve the cache immediately; refresh in the background if stale.
             if plugin.isAvailable,
@@ -1665,6 +1743,47 @@ private struct ClaudeSettingsView: View {
     private var advancedSettings: some View {
         VStack(alignment: .leading, spacing: 12) {
             reasoningEffortSettings
+            promptCacheSettings
+            lastRequestSummary
+        }
+    }
+
+    private var promptCacheSettings: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Picker(String(localized: "Prompt Caching", bundle: bundle), selection: $promptCache) {
+                Text("Off", bundle: bundle).tag(ClaudePromptCache.off)
+                Text("5 minutes", bundle: bundle).tag(ClaudePromptCache.fiveMinutes)
+                Text("1 hour", bundle: bundle).tag(ClaudePromptCache.oneHour)
+            }
+            .pickerStyle(.menu)
+            .onChange(of: promptCache) {
+                plugin.setPromptCache(promptCache)
+            }
+
+            Text("Reuses the system prompt across requests within this time, so repeated requests cost less. Only prompts of at least 512 to 4,096 tokens (depending on the model) are cached. Writing the cache costs 1.25× (5 minutes) or 2× (1 hour), reading it a tenth or less. Changing the model or reasoning effort starts a new cache.", bundle: bundle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// Refreshes while visible so a dictation made with the settings open shows up.
+    private var lastRequestSummary: some View {
+        TimelineView(.periodic(from: .now, by: 2)) { _ in
+            if let summary = plugin.lastRequestSummary {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Last Request", bundle: bundle)
+                        .font(.caption.weight(.semibold))
+                    Text(verbatim: "\(summary.date.formatted(date: .omitted, time: .shortened)) · \(summary.model)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Cache: \(summary.cacheReadInputTokens) read, \(summary.cacheCreationInputTokens) written · Input: \(summary.inputTokens) · Output: \(summary.outputTokens) tokens", bundle: bundle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                        .textSelection(.enabled)
+                }
+            }
         }
     }
 

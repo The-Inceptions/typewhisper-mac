@@ -664,7 +664,7 @@ final class ClaudePluginTests: XCTestCase {
         let message = Self.apiErrorMessage(error)
         XCTAssertTrue(message.hasPrefix("Model claude-opus-9 isn't available to this API key: model: claude-opus-9."), message)
         XCTAssertTrue(message.contains("Refresh the model list"), message)
-        XCTAssertTrue(message.contains("[HTTP 404 not_found_error · model claude-opus-9 · request req_header]"), message)
+        XCTAssertTrue(message.contains("[HTTP 404 not_found_error · model claude-opus-9 · cache 5m · request req_header]"), message)
     }
 
     func testRequestIdFallsBackToErrorBody() async throws {
@@ -1058,6 +1058,91 @@ final class ClaudePluginTests: XCTestCase {
         )
     }
 
+    // MARK: - Prompt caching
+
+    func testSystemPromptIsCachedForFiveMinutesByDefault() async throws {
+        let body = try Self.jsonBody(
+            from: await Self.capturedRequest(model: "claude-opus-5-5", systemPrompt: "Fix grammar.")
+        )
+        let system = try XCTUnwrap(body["system"] as? [[String: Any]])
+        XCTAssertEqual(system.count, 1)
+        XCTAssertEqual(system.first?["type"] as? String, "text")
+        XCTAssertEqual(system.first?["text"] as? String, "Fix grammar.")
+        XCTAssertEqual(system.first?["cache_control"] as? [String: String], ["type": "ephemeral"])
+        XCTAssertNil(body["cache_control"], "no automatic breakpoint after the dictated text")
+        let messages = try XCTUnwrap(body["messages"] as? [[String: Any]])
+        XCTAssertEqual(messages.first?["content"] as? String, "hi", "the dictated text stays a plain, uncached string")
+    }
+
+    func testOneHourCachingSendsTheTTL() async throws {
+        let body = try Self.jsonBody(
+            from: await Self.capturedRequest(
+                model: "claude-opus-5-5",
+                systemPrompt: "Fix grammar.",
+                defaults: ["promptCacheTTL": "1h"]
+            )
+        )
+        let system = try XCTUnwrap(body["system"] as? [[String: Any]])
+        XCTAssertEqual(system.first?["cache_control"] as? [String: String], ["type": "ephemeral", "ttl": "1h"])
+    }
+
+    func testCachingOffSendsThePlainSystemPrompt() async throws {
+        let body = try Self.jsonBody(
+            from: await Self.capturedRequest(
+                model: "claude-opus-5-5",
+                systemPrompt: "Fix grammar.",
+                defaults: ["promptCacheTTL": "off"]
+            )
+        )
+        XCTAssertEqual(body["system"] as? String, "Fix grammar.")
+    }
+
+    func testBlankSystemPromptIsNotSentAsACacheBlock() async throws {
+        let body = try Self.jsonBody(from: await Self.capturedRequest(model: "claude-opus-5-5", systemPrompt: "  "))
+        XCTAssertEqual(body["system"] as? String, "  ", "the API rejects a text block without text")
+    }
+
+    func testLastRequestSummaryReportsCacheUsage() async throws {
+        let host = try PluginTestHostServices()
+        let plugin = ClaudePlugin()
+        plugin.activate(host: host) // no key on host → no background model refresh
+        plugin.setApiKey("claude-key")
+        XCTAssertNil(plugin.lastRequestSummary)
+
+        let body = #"""
+        {"model":"claude-opus-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn",
+         "usage":{"input_tokens":12,"cache_read_input_tokens":1600,"cache_creation_input_tokens":0,"output_tokens":40}}
+        """#
+        let store = PluginHTTPClientSessionStore()
+        PluginHTTPClientTestHarness.configure { _ in
+            store.makeSession(outcomes: [
+                .success(Data(body.utf8), Self.httpResponse(url: Self.messagesURL, statusCode: 200)),
+            ])
+        }
+
+        _ = try await plugin.process(systemPrompt: "sys", userText: "hi", model: "claude-opus-5-5")
+        let summary = try XCTUnwrap(plugin.lastRequestSummary)
+        XCTAssertEqual(summary.model, "claude-opus-5-5")
+        XCTAssertEqual(summary.inputTokens, 12)
+        XCTAssertEqual(summary.cacheReadInputTokens, 1600)
+        XCTAssertEqual(summary.cacheCreationInputTokens, 0)
+        XCTAssertEqual(summary.outputTokens, 40)
+    }
+
+    func testPromptCacheSettingPersists() throws {
+        let host = try PluginTestHostServices()
+        let plugin = ClaudePlugin()
+        plugin.activate(host: host)
+        XCTAssertEqual(plugin.promptCache, .fiveMinutes)
+
+        plugin.setPromptCache(.oneHour)
+        XCTAssertEqual(host.userDefault(forKey: "promptCacheTTL") as? String, "1h")
+
+        let reactivated = ClaudePlugin()
+        reactivated.activate(host: host)
+        XCTAssertEqual(reactivated.promptCache, .oneHour)
+    }
+
     // MARK: - Helpers
 
     private static func waitForRefreshWaiterCount(_ expectedCount: Int, plugin: ClaudePlugin) async {
@@ -1133,6 +1218,7 @@ final class ClaudePluginTests: XCTestCase {
     private static func capturedRequest(
         model: String,
         effort: String? = nil,
+        systemPrompt: String = "sys",
         defaults: [String: Any] = [:],
         cache: ClaudeModelCache? = nil
     ) async throws -> URLRequest {
@@ -1151,7 +1237,7 @@ final class ClaudePluginTests: XCTestCase {
             ])
         }
         _ = try await plugin.process(
-            systemPrompt: "sys",
+            systemPrompt: systemPrompt,
             userText: "hi",
             model: model,
             temperatureDirective: .inheritProviderSetting,

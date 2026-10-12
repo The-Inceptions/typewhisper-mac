@@ -682,6 +682,160 @@
           }
         }
       }
+    },
+    "Prompt Caching": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "プロンプトキャッシュ"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Prompt-Caching"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "提示缓存"
+          }
+        }
+      }
+    },
+    "Off": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "オフ"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aus"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "关闭"
+          }
+        }
+      }
+    },
+    "5 minutes": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "5分"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "5 Minuten"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "5 分钟"
+          }
+        }
+      }
+    },
+    "1 hour": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "1時間"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "1 Stunde"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "1 小时"
+          }
+        }
+      }
+    },
+    "Reuses the system prompt across requests within this time, so repeated requests cost less. Only prompts of at least 512 to 4,096 tokens (depending on the model) are cached. Writing the cache costs 1.25× (5 minutes) or 2× (1 hour), reading it a tenth or less. Changing the model or reasoning effort starts a new cache.": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "この時間内のリクエスト間でシステムプロンプトを再利用し、繰り返しのリクエストのコストを下げます。キャッシュされるのは、モデルに応じて512〜4,096トークン以上のプロンプトのみです。キャッシュの書き込みは1.25倍（5分）または2倍（1時間）、読み取りは10分の1以下のコストです。モデルや思考負荷を変更すると、新しいキャッシュが作成されます。"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Verwendet den Systemprompt innerhalb dieser Zeit für weitere Anfragen wieder, sodass wiederholte Anfragen weniger kosten. Zwischengespeichert werden nur Prompts ab 512 bis 4.096 Tokens (je nach Modell). Das Schreiben des Caches kostet das 1,25-Fache (5 Minuten) bzw. das 2-Fache (1 Stunde), das Lesen ein Zehntel oder weniger. Ein Wechsel des Modells oder des Denkaufwands startet einen neuen Cache."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在此时间内的多次请求之间复用系统提示，降低重复请求的费用。只有至少 512 到 4,096 个 token（取决于模型）的提示才会被缓存。写入缓存的费用为 1.25 倍（5 分钟）或 2 倍（1 小时），读取缓存的费用为十分之一或更低。更换模型或推理力度会开始新的缓存。"
+          }
+        }
+      }
+    },
+    "Last Request": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "前回のリクエスト"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Letzte Anfrage"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "上次请求"
+          }
+        }
+      }
+    },
+    "Cache: %lld read, %lld written · Input: %lld · Output: %lld tokens": {
+      "localizations": {
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "キャッシュ: 読み取り %lld、書き込み %lld · 入力: %lld · 出力: %lld トークン"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cache: %lld gelesen, %lld geschrieben · Eingabe: %lld · Ausgabe: %lld Tokens"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "缓存：读取 %lld，写入 %lld · 输入：%lld · 输出：%lld 个 token"
+          }
+        }
+      }
     }
   },
   "version": "1.0"
