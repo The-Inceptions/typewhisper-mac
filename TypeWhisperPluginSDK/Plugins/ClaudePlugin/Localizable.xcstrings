@@ -782,7 +782,7 @@
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Verwendet den Systemprompt innerhalb dieser Zeit für weitere Anfragen wieder, sodass wiederholte Anfragen weniger kosten. Zwischengespeichert werden nur Prompts ab 512 bis 4.096 Tokens (je nach Modell). Das Schreiben des Caches kostet das 1,25-Fache (5 Minuten) bzw. das 2-Fache (1 Stunde), das Lesen ein Zehntel oder weniger. Ein Wechsel des Modells oder des Denkaufwands startet einen neuen Cache."
+            "value": "Verwendet den Systemprompt innerhalb dieser Zeit für weitere Anfragen wieder, sodass wiederholte Anfragen weniger kosten. Zwischengespeichert werden Prompts, die die modellabhängige Mindestlänge erreichen oder überschreiten. Diese liegt je nach Modell zwischen 512 und 4.096 Tokens. Das Schreiben des Caches kostet das 1,25-Fache (5 Minuten) bzw. das 2-Fache (1 Stunde), das Lesen ein Zehntel oder weniger. Ein Wechsel des Modells oder des Denkaufwands startet einen neuen Cache."
           }
         },
         "zh-Hans": {

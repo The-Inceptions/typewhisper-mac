@@ -1006,7 +1006,9 @@ final class ClaudePlugin: NSObject, LLMProviderPlugin, LLMTemperatureAndEffortCo
             let summary = PluginHTTPErrorBodyFormatter.summary(from: data, response: httpResponse)
             let message = "Couldn't read Claude's reply (\(data.count) bytes): \(summary) "
                 + Self.detailSuffix(statusCode: 200, context: context, requestId: requestId)
-            Self.logger.error("\(message, privacy: .public)")
+            Self.logger.error(
+                "Couldn't read Claude's reply (\(data.count) bytes) \(Self.detailSuffix(statusCode: 200, context: context, requestId: requestId), privacy: .public): \(summary, privacy: .private)"
+            )
             throw PluginChatError.apiError(message)
         }
 
